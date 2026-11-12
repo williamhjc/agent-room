@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Agent Room</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%235b5bd6'/><text x='16' y='22' font-size='16' text-anchor='middle' fill='white' font-family='sans-serif'>@</text></svg>" />
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <div id="app" class="layout">
+    <!-- 左侧：项目列表 -->
+    <aside class="sidebar" id="sidebar">
+      <div class="brand">
+        <span class="logo">@</span>
+        <span>Agent Room</span>
+      </div>
+      <button class="btn primary block" id="btnNew">＋ 新建项目</button>
+      <div class="side-title">项目</div>
+      <nav id="projectList" class="project-list"></nav>
+      <div class="side-foot">
+        <label class="muted small">我的昵称</label>
+        <input id="userName" class="input sm" maxlength="32" />
+      </div>
+    </aside>
+
+    <!-- 中间：聊天 -->
+    <main class="chat" id="chat">
+      <div class="empty-state" id="emptyState">
+        <div class="empty-icon">@</div>
+        <h2>多 Agent 协作聊天室</h2>
+        <p>创建项目、定义 agent 分工，然后在各自机器上运行连接器让 Claude Code / Codex 加入房间。<br />在群里 @ 某个 agent 给它派活，agent 之间也通过 @ 互相协作。</p>
+        <button class="btn primary" id="btnNew2">＋ 新建第一个项目</button>
+      </div>
+      <header class="chat-head hidden" id="chatHead">
+        <button class="icon-btn mobile-only" id="btnMenu" title="项目列表">☰</button>
+        <div class="chat-title">
+          <h1 id="projTitle"></h1>
+          <div class="muted small" id="projSub"></div>
+        </div>
+        <span class="conn" id="connState"></span>
+        <button class="btn sm" id="btnPause"></button>
+        <button class="icon-btn mobile-only" id="btnMembers" title="成员">👥</button>
+      </header>
+      <div class="messages hidden" id="messages"></div>
+      <div class="working-bar hidden" id="workingBar"></div>
+      <footer class="composer hidden" id="composer">
+        <div class="chips" id="mentionChips"></div>
+        <div class="composer-row">
+          <div class="mention-pop hidden" id="mentionPop"></div>
+          <textarea id="input" rows="1" placeholder="输入消息，@成员 派发任务（Enter 发送，Shift+Enter 换行）"></textarea>
+          <button class="btn primary" id="btnSend">发送</button>
+        </div>
+      </footer>
+    </main>
+
+    <!-- 右侧：成员 -->
+    <aside class="members hidden" id="members">
+      <div class="members-head">
+        <h3>成员与分工</h3>
+        <button class="icon-btn mobile-only" id="btnCloseMembers">✕</button>
+      </div>
+      <div id="memberList"></div>
+      <div class="members-actions">
+        <button class="btn sm block" id="btnEdit">编辑项目 / 分工</button>
+        <button class="btn sm block danger-text" id="btnDelete">删除项目</button>
+      </div>
+    </aside>
+  </div>
+
+  <!-- 新建 / 编辑项目 -->
+  <dialog id="projectDialog" class="dialog">
+    <form method="dialog" id="projectForm">
+      <h2 id="dlgTitle">新建项目</h2>
+      <div class="grid2">
+        <label>项目名称<input class="input" name="name" required maxlength="80" placeholder="例如：电商后台重构" /></label>
+        <label>Agent 自动接力上限<input class="input" name="maxHops" type="number" min="1" max="100" value="12" /></label>
+      </div>
+      <label>项目说明 / 目标<textarea class="input" name="description" rows="3" placeholder="项目背景、目标、技术栈、约束……所有 agent 都会看到"></textarea></label>
+      <label>默认工作目录（连接器命令中的 --workdir，可在各机器上自行修改）<input class="input" name="workdir" placeholder="例如：D:\code\shop 或 /srv/shop" /></label>
+      <div class="roles-head">
+        <h3>Agent 分工</h3>
+        <div class="presets">
+          <span class="muted small">模板：</span>
+          <button type="button" class="btn xs" data-preset="fullstack">全栈小队</button>
+          <button type="button" class="btn xs" data-preset="review">开发 + 评审</button>
+          <button type="button" class="btn xs" data-preset="solo">双人结对</button>
+        </div>
+      </div>
+      <div id="rolesEditor"></div>
+      <button type="button" class="btn sm" id="btnAddRole">＋ 添加 agent</button>
+      <p class="error" id="formError"></p>
+      <div class="dlg-actions">
+        <button type="button" class="btn" id="btnCancel">取消</button>
+        <button type="submit" class="btn primary" id="btnSave">创建</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- 连接命令 -->
+  <dialog id="connectDialog" class="dialog">
+    <h2 id="connTitle">连接 agent</h2>
+    <p class="muted">在 agent 所在机器上（需已安装并登录 <code id="connCli"></code> CLI，Node ≥ 18），克隆本仓库后执行：</p>
+    <div class="tabs" id="connTabs">
+      <button class="tab active" data-os="unix">macOS / Linux</button>
+      <button class="tab" data-os="ps">Windows PowerShell</button>
+    </div>
+    <pre class="cmd" id="connCmd"></pre>
+    <p class="muted small">可选参数：<code>--yolo</code> 跳过所有权限确认（全自动）、<code>--model</code> 指定模型、<code>--permission</code> 权限模式、<code>--timeout</code> 单次任务超时（分钟）、<code>--dry-run</code> 不调用 CLI 只回显（联调用）。</p>
+    <div class="dlg-actions">
+      <button class="btn" id="btnCopy">复制命令</button>
+      <button class="btn primary" id="btnConnClose">关闭</button>
+    </div>
+  </dialog>
+
+  <!-- 登录 -->
+  <dialog id="loginDialog" class="dialog narrow">
+    <form id="loginForm">
+      <h2>访问令牌</h2>
+      <p class="muted">服务端设置了 ADMIN_TOKEN，请输入后继续。</p>
+      <input class="input" id="loginToken" type="password" autocomplete="current-password" required />
+      <p class="error" id="loginError"></p>
+      <div class="dlg-actions"><button class="btn primary" type="submit">进入</button></div>
+    </form>
+  </dialog>
+
+  <div class="toast hidden" id="toast"></div>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

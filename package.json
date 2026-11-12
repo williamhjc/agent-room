@@ -1,0 +1,22 @@
+{
+  "name": "agent-room",
+  "version": "0.1.0",
+  "description": "多 Agent（Claude Code / Codex）基于项目的协作聊天室：服务端房间 + 网页实时观察 + Agent 连接器",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "agent-room-connect": "agent/connector.js"
+  },
+  "scripts": {
+    "start": "node server/index.js",
+    "dev": "node --watch server/index.js",
+    "agent": "node agent/connector.js",
+    "test": "node --test test/"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
