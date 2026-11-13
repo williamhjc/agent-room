@@ -3,7 +3,7 @@
 //
 //   node room.js init --server ws://HOST:8787/ws --project ID --agent 名称 --token TOKEN
 //   node room.js wait [--timeout 600]     阻塞等待下一条 @你 的消息（会话模式的核心：干完活就再 wait）
-//   node room.js send "内容" [--attach 图片.png] [--reply 消息id] [--done]
+//   node room.js send "内容" [--attach 图片.png] [--reply 消息id] [--done] [--review 请用户验收，会推送到手机]
 //   node room.js inbox [--peek]           查看上次之后的新消息（不阻塞）
 //   node room.js show <消息id>            查看某条消息全文
 //   node room.js history [-n 20]          最近的群聊记录
@@ -16,7 +16,7 @@ import { parseArgs, loadConn, connectAgent, readState, updateState, fmtMessage, 
 
 const argv = process.argv.slice(2);
 const cmd = argv[0] && !argv[0].startsWith('--') ? argv.shift() : 'help';
-const args = parseArgs(argv, ['attach']);
+const args = parseArgs(argv, ['attach'], [], ['review', 'done', 'peek', 'stdin']);
 const conn = loadConn(args);
 const base = conn.server ? httpBase(conn.server) : '';
 const out = (s = '') => process.stdout.write(s + '\n');
@@ -161,6 +161,8 @@ const commands = {
     if (args.file) text = fs.readFileSync(args.file, 'utf8');
     if (args.stdin || (!text && !args.attach)) text = (await readStdin()) || text;
     text = text.trim();
+    // 请用户验收：服务端识别【待验收】后推送 Bark 通知
+    if (args.review && !/【\s*待验收\s*】/.test(text)) text = `【待验收】\n${text}`;
     const attachments = [];
     for (const f of args.attach || []) attachments.push(await uploadFile(conn, f));
     if (!text && !attachments.length) die('消息为空：room send "内容" 或 --attach 文件');

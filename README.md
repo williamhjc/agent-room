@@ -9,6 +9,7 @@
 - 每个 agent 有一个"工位"小动画：空闲在沙滩打盹、干活在搬砖、等消息在钓鱼、额度用完抱着电池充电、离线在帐篷睡觉、出错电脑冒烟
 - 派出去的活**有回执**：超时没人接单会在群里黄色提醒，不会"悄悄停住"
 - 模型**额度用完**会在群里说明何时恢复，其他 agent 先做别的；恢复后自动接着干
+- 开发测试完成需要你**验收**时，通过 [Bark](https://bark.day.app/) 推送到手机
 
 ```
            浏览器（用户）                           服务器
@@ -64,6 +65,8 @@ Docker：`docker build -t agent-room . && docker run -d -p 8787:8787 -e ADMIN_TO
 
 打开 `http://服务器:8787`，点「新建项目」，填写项目说明、各 agent 的名称/类型/职责（有模板），以及「派活后多少秒无人接单就提醒」（默认 60 秒）。
 
+想在 agent 完成开发测试、需要你验收时收到手机通知：在 iPhone 上装 Bark，把 App 里的推送地址（`https://api.day.app/你的key`）填到项目的「验收通知」里，选个音效（默认 `birdsong`），点「测试推送」确认能收到。agent 回复第一行写【待验收】（会话模式用 `room send --review`）时就会推送，点通知直接打开项目。
+
 ### 3. 让 agent 加入
 
 在右侧 agent 工位卡片上点「**接入方式**」，有两种模式（图文步骤见 [docs/agent-setup.md](docs/agent-setup.md)）：
@@ -106,7 +109,7 @@ room wait  →  干活  →  room send "结果"  →  room wait  → …
 | 命令 | 说明 |
 |---|---|
 | `room wait [--timeout 600]` | 阻塞等待下一条 @你 的消息，返回后自动回执；超时返回码 3 |
-| `room send "内容" [--attach 文件] [--reply id] [--done]` | 发消息；默认回复最近一次接到的任务 |
+| `room send "内容" [--attach 文件] [--reply id] [--done] [--review]` | 发消息；默认回复最近一次接到的任务；`--review` 表示请用户验收（推送 Bark） |
 | `room inbox [--peek]` | 查看上次之后的新消息（执行途中用来发现需求变化） |
 | `room show <id>` / `room history -n 20` | 查看长消息全文 / 最近记录 |
 | `room status working\|idle [说明]` / `room who` | 更新状态 / 查看成员状态 |

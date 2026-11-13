@@ -6,7 +6,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
-import { Store, newId, parseMentions } from './store.js';
+import { Store, newId, parseMentions, normBarkUrl } from './store.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(__dirname, '..');
@@ -33,9 +33,52 @@ function safeEqual(a, b) {
 function isAdmin(token) {
   return !ADMIN_TOKEN || (token && safeEqual(token, ADMIN_TOKEN));
 }
-/** 发给 agent / 广播时去掉 token */
+/** 发给 agent / 广播时去掉 token 和 Bark 推送地址（相当于推送密钥） */
 function publicProject(p) {
-  return { ...p, agents: p.agents.map(({ token, ...a }) => a) };
+  const { barkUrl, ...rest } = p;
+  return { ...rest, hasBark: !!barkUrl, agents: p.agents.map(({ token, ...a }) => a) };
+}
+
+// ---------- Bark 推送（agent 发出【待验收】时通知用户） ----------
+const REVIEW_RE = /【\s*待验收\s*】|\[\s*待验收\s*\]|#待验收/;
+async function sendBark(barkUrl, { title, body, sound, group, url }) {
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), 10_000);
+  try {
+    const res = await fetch(barkUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json; charset=utf-8' },
+      body: JSON.stringify({ title, body, sound: sound || 'birdsong', group, url, level: 'timeSensitive' }),
+      signal: ctl.signal,
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || (data.code !== undefined && data.code !== 200)) throw new Error(data.message || `HTTP ${res.status}`);
+    return data;
+  } finally {
+    clearTimeout(t);
+  }
+}
+function projectLink(p) {
+  const base = (process.env.PUBLIC_URL || '').replace(/\/$/, '');
+  return base ? `${base}/#/p/${p.id}` : undefined;
+}
+const lastReviewPush = new Map(); // projectId:agent -> ts，防止短时间重复推送
+function notifyReview(p, msg) {
+  if (!p.barkUrl) return;
+  const key = `${p.id}:${msg.from}`;
+  if (Date.now() - (lastReviewPush.get(key) || 0) < 60_000) return;
+  lastReviewPush.set(key, Date.now());
+  const body = msg.text.replace(REVIEW_RE, '').replace(/[#*`>_]/g, '').replace(/\s+/g, ' ').trim().slice(0, 300);
+  sendBark(p.barkUrl, {
+    title: `【待验收】${p.name}`,
+    body: `@${msg.from}：${body || '开发测试已完成，请验收'}`,
+    sound: p.barkSound,
+    group: p.name,
+    url: projectLink(p),
+  }).catch((e) => {
+    console.error('[agent-room] Bark 推送失败', e.message);
+    systemMessage(p.id, `Bark 推送失败：${e.message}。请在「编辑项目」里检查推送地址。`, { kind: 'ack-timeout' });
+  });
 }
 function sendJson(res, code, data) {
   const body = JSON.stringify(data);
@@ -224,7 +267,10 @@ function postMessage(projectId, { from, fromType, text, replyTo, attachments, me
   };
   if (attachments?.length) msg.attachments = attachments;
   if (meta) msg.meta = meta;
+  const isReview = fromType === 'agent' && REVIEW_RE.test(text);
+  if (isReview) msg.meta = { ...(msg.meta || {}), kind: 'review' };
   store.addMessage(projectId, msg);
+  if (isReview) notifyReview(p, msg);
   const quotaNotes = [];
 
   // 发送者是 agent：更新活跃时间；不支持回执的旧客户端，发言即视为已接单
@@ -409,11 +455,38 @@ function authOf(req, project) {
   return isAdmin(tok) ? { admin: true } : null;
 }
 
+/** POST /api/bark-test { projectId?, barkUrl?, barkSound? }：测试推送，可传入尚未保存的地址 */
+async function barkTest(req, res) {
+  if (!authOf(req, null)?.admin) return sendJson(res, 401, { error: '未授权：请输入正确的访问令牌' });
+  const body = await readBody(req);
+  const p = body.projectId ? store.getProject(body.projectId) : null;
+  let barkUrl;
+  try {
+    barkUrl = body.barkUrl ? normBarkUrl(body.barkUrl) : p?.barkUrl;
+  } catch (e) {
+    return sendJson(res, 400, { error: e.message });
+  }
+  if (!barkUrl) return sendJson(res, 400, { error: '请先填写 Bark 推送地址' });
+  try {
+    await sendBark(barkUrl, {
+      title: 'Agent Room 测试推送',
+      body: `${p ? `项目「${p.name}」` : '新项目'}：agent 完成开发测试、需要你验收时会这样通知你。`,
+      sound: body.barkSound || p?.barkSound || 'birdsong',
+      group: p?.name || 'Agent Room',
+      url: p ? projectLink(p) : undefined,
+    });
+    return sendJson(res, 200, { ok: true });
+  } catch (e) {
+    return sendJson(res, 502, { error: `推送失败：${e.message}` });
+  }
+}
+
 async function handleApi(req, res, url) {
   const parts = url.pathname.split('/').filter(Boolean); // ['api', ...]
   if (parts[1] === 'config' && req.method === 'GET') {
     return sendJson(res, 200, { authRequired: !!ADMIN_TOKEN, publicUrl: process.env.PUBLIC_URL || '' });
   }
+  if (parts[1] === 'bark-test' && req.method === 'POST') return barkTest(req, res);
   if (parts[1] !== 'projects') return sendJson(res, 404, { error: 'not found' });
   const id = parts[2];
   const p = id ? store.getProject(id) : null;
@@ -440,6 +513,7 @@ async function handleApi(req, res, url) {
 
   // 以下仅管理员
   if (!auth.admin) return sendJson(res, 403, { error: '该操作需要管理员令牌' });
+
 
   if (!id) {
     if (req.method === 'GET') {

@@ -304,13 +304,15 @@ function messageEl(m) {
   const t = new Date(m.ts);
   const time = t.toLocaleString('zh-CN', { hour12: false, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
   const parent = m.replyTo && S.messages.find((x) => x.id === m.replyTo);
-  el.className = `msg ${isMe ? 'me' : `agent-${type}`}${m.meta?.kind === 'quota' ? ' quota-msg' : ''}`;
+  const kind = m.meta?.kind;
+  el.className = `msg ${isMe ? 'me' : `agent-${type}`}${kind === 'quota' ? ' quota-msg' : kind === 'review' ? ' review-msg' : ''}`;
   el.innerHTML = `
     <div class="avatar ${type}" title="${esc(m.from)}">${headIcon(type, esc([...m.from][0] || '?'))}</div>
     <div class="msg-body">
       <div class="msg-meta">
         <span class="who">${esc(m.from)}</span>
         ${isMe ? '' : `<span class="tag ${type}">${type === 'codex' ? 'Codex' : 'Claude'}</span>`}
+        ${kind === 'review' ? '<span class="review-badge">待你验收</span>' : ''}
         <span class="time">${time}</span>
       </div>
       ${parent ? `<div class="reply-ref">↪ 回复 ${esc(parent.from)}：${esc(parent.text.slice(0, 40))}${parent.text.length > 40 ? '…' : ''}</div>` : ''}
@@ -546,6 +548,7 @@ function sessionPrompt(a, os) {
 - 回复：${room} send "内容"（需要别人接手就在内容里 @对方；截图/文件用 --attach 路径，不要贴 base64）
 - 干活中途看新消息：${room} inbox（需求可能变了，例如有了更新的提交号；过时的任务不要继续做）
 - 其他：${room} who 看成员状态；${room} show <id> 看长消息全文；${room} get <附件URL> 下载附件
+- 请用户验收：一项需求开发和测试都完成、需要用户亲自验收时，用 ${room} send --review "做了什么 / 怎么验收（打开哪里、步骤、预期结果）/ 已知问题"，用户会收到手机推送。中间进度和 agent 之间交接不要用
 
 工作循环（务必遵守）：
 1. 运行 room wait 拿到任务；
@@ -843,10 +846,38 @@ function openProjectDialog(project) {
   f.workdir.value = project?.workdir || '';
   f.maxHops.value = project?.maxHops || 12;
   f.ackTimeoutSec.value = project?.ackTimeoutSec || 60;
+  f.barkUrl.value = '';
+  f.barkUrl.dataset.loaded = project ? '' : '1';
+  f.barkSound.value = project?.barkSound || 'birdsong';
+  $('#barkHint').textContent = '';
   setRoles(project ? project.agents : PRESETS.fullstack);
   $('#projectDialog').showModal();
   f.name.focus();
+  // 推送地址不随群消息广播，编辑时单独取一次
+  if (project) {
+    api(`/api/projects/${project.id}`)
+      .then(({ project: full }) => {
+        if (S.editing?.id !== full.id) return;
+        if (!f.barkUrl.value) f.barkUrl.value = full.barkUrl || '';
+        f.barkUrl.dataset.loaded = '1';
+      })
+      .catch(() => {});
+  }
 }
+$('#btnBarkTest').onclick = async () => {
+  const f = $('#projectForm');
+  const hint = $('#barkHint');
+  hint.className = 'hint';
+  hint.textContent = '推送中…';
+  try {
+    await api('/api/bark-test', { method: 'POST', body: { projectId: S.editing?.id, barkUrl: f.barkUrl.value, barkSound: f.barkSound.value } });
+    hint.className = 'hint ok';
+    hint.textContent = '已发送，请看手机。';
+  } catch (err) {
+    hint.className = 'hint err';
+    hint.textContent = err.message;
+  }
+};
 document.querySelectorAll('[data-preset]').forEach((b) => (b.onclick = () => setRoles(PRESETS[b.dataset.preset])));
 $('#btnAddRole').onclick = () => $('#rolesEditor').appendChild(roleRow());
 $('#btnCancel').onclick = () => $('#projectDialog').close();
@@ -864,6 +895,9 @@ $('#projectForm').addEventListener('submit', async (e) => {
     workdir: f.workdir.value,
     maxHops: f.maxHops.value,
     ackTimeoutSec: f.ackTimeoutSec.value,
+    // 地址还没取回来且没改动时不提交，避免误清空
+    ...(f.barkUrl.dataset.loaded || f.barkUrl.value ? { barkUrl: f.barkUrl.value } : {}),
+    barkSound: f.barkSound.value,
     agents,
   };
   try {

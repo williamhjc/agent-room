@@ -260,3 +260,50 @@ test('额度用完：连接器在群里说明并通知派活的 agent，消息�
   assert.ok(!user.msgs.find((m) => m.meta?.kind === 'ack-timeout' && m.text.includes('@Alice')), '额度等待期间不应报 Alice 超时');
   user.ws.close();
 });
+
+test('验收通知：agent 发出【待验收】时推送 Bark，推送地址不外泄给 agent', async () => {
+  const http = await import('node:http');
+  const got = [];
+  const bark = http.createServer((req, res) => {
+    let b = '';
+    req.on('data', (d) => (b += d));
+    req.on('end', () => {
+      got.push({ path: req.url, body: JSON.parse(b) });
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify({ code: 200, message: 'success' }));
+    });
+  });
+  await new Promise((r) => bark.listen(0, '127.0.0.1', r));
+  const barkUrl = `http://127.0.0.1:${bark.address().port}/KEY123/`;
+  const { project, tok } = await newProject([{ name: 'Dev', type: 'claude' }], { barkUrl });
+  assert.equal(project.barkUrl, barkUrl.replace(/\/$/, ''));
+  assert.equal(project.barkSound, 'birdsong');
+
+  // 测试推送接口
+  const t = await api('/api/bark-test', { method: 'POST', body: { projectId: project.id } });
+  assert.ok(t.ok, JSON.stringify(t));
+  assert.equal(got.at(-1).path, '/KEY123');
+
+  // agent 的 welcome 里不含推送地址
+  const w = start(['agent/room.js', 'who'], roomEnv(project, 'Dev', tok.Dev), { capture: true });
+  await exited(w);
+  const user = await userClient(project.id);
+  await sleep(200);
+  // 普通消息不推送；--review 推送
+  const n0 = got.length;
+  assert.equal(await exited(start(['agent/room.js', 'send', '进度：接口写了一半'], roomEnv(project, 'Dev', tok.Dev))), 0);
+  assert.equal(await exited(start(['agent/room.js', 'send', '--review', '登录功能已完成，打开 /login 用 test/test 登录'], roomEnv(project, 'Dev', tok.Dev))), 0);
+  await waitFor(() => got.length > n0);
+  await sleep(300);
+  assert.equal(got.length, n0 + 1, '只有待验收消息会推送');
+  const push = got.at(-1).body;
+  assert.match(push.title, /待验收/);
+  assert.match(push.body, /@Dev：登录功能已完成/);
+  assert.equal(push.sound, 'birdsong');
+  const msg = user.msgs.find((m) => m.meta?.kind === 'review');
+  assert.ok(msg && msg.text.startsWith('【待验收】'));
+  const { normBarkUrl } = await import('../server/store.js');
+  assert.equal(normBarkUrl('https://api.day.app/abc/这里改成你自己的推送内容'), 'https://api.day.app/abc');
+  user.ws.close();
+  bark.close();
+});

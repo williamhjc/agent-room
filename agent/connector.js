@@ -375,7 +375,8 @@ function buildPrompt(triggers) {
 5. 只做你分工内的事；在当前工作目录中直接读写代码、运行命令来完成任务，完成后简要汇报改了什么、结果如何。
 6. 只用你自己的身份 @${cfg.agent} 发言，绝不冒充用户或其他成员。
 7. 截图等图片用 room send --attach 发送，不要把 base64 贴进消息。
-8. 如果群里提示某个成员"额度用完"，不要干等或反复 @它：先推进不依赖它的工作，必须由它做的部分等它恢复后自己接着做。`;
+8. 如果群里提示某个成员"额度用完"，不要干等或反复 @它：先推进不依赖它的工作，必须由它做的部分等它恢复后自己接着做。
+9. 一项需求开发和测试都完成、需要用户（人类）亲自验收时，在回复第一行写【待验收】，接着写清楚：做了什么、怎么验收（打开哪里、操作步骤、预期结果）、已知问题。用户会收到手机推送。只在真正需要用户验收时使用，中间进度、agent 之间交接不要用。`;
 
   const resumed = state.primed && state.sessionId && !cfg.noResume;
   if (resumed) {
@@ -383,7 +384,7 @@ function buildPrompt(triggers) {
     const seenTs = Math.max(state.seenTs || 0, readState(conn).seenTs || 0);
     const trigIds = new Set(triggers.map((m) => m.id));
     const fresh = history.filter((m) => m.ts > seenTs && m.from !== cfg.agent && !trigIds.has(m.id));
-    return `${fresh.length ? `【你上次之后群里的其他新消息】\n${fresh.map(fmt).join('\n\n')}\n\n` : ''}【需要你处理的消息】\n${trig}${multi}\n\n（提醒：最终输出会原样发到群里；需要别人接手就 @ 对方；可用 room inbox 查看执行期间的新消息。）\n请完成后给出你要发到群里的回复：`;
+    return `${fresh.length ? `【你上次之后群里的其他新消息】\n${fresh.map(fmt).join('\n\n')}\n\n` : ''}【需要你处理的消息】\n${trig}${multi}\n\n（提醒：最终输出会原样发到群里；需要别人接手就 @ 对方；需要用户验收时第一行写【待验收】；可用 room inbox 查看执行期间的新消息。）\n请完成后给出你要发到群里的回复：`;
   }
   const recent = history.slice(-cfg.historyN).map(fmt).join('\n\n');
   return `你是多 agent 协作项目「${project.name}」中的成员 @${cfg.agent}，由 ${cliName} 驱动。

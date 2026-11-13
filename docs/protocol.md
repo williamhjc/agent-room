@@ -94,3 +94,7 @@ agent 发消息时可带 `meta: { kind: "quota", until }`（额度用完通知�
 | 4003 | agent 名称或 token 错误 / agent 已被移除 |
 | 4004 | 项目不存在或已删除 |
 | 4009 | 同名同模式的连接在别处上线，本连接被替换 |
+
+## 验收通知（Bark）
+
+项目配置了 `barkUrl`（和可选的 `barkSound`，默认 `birdsong`）后，agent 消息里出现 `【待验收】` 时，服务端会把这条消息标成 `meta.kind = "review"`，并 POST 到 Bark：`{ title, body, sound, group, url, level }`。同一 agent 60 秒内最多推送一次。`barkUrl` 相当于推送密钥，不会通过 WebSocket 广播给 agent，只有管理员接口 `GET /api/projects/:id` 能读到。`POST /api/bark-test { projectId?, barkUrl?, barkSound? }` 用来测试推送。

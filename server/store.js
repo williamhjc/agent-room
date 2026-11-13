@@ -58,7 +58,7 @@ export class Store {
     });
   }
 
-  createProject({ name, description, workdir, agents, maxHops, ackTimeoutSec }) {
+  createProject({ name, description, workdir, agents, maxHops, ackTimeoutSec, barkUrl, barkSound }) {
     name = String(name || '').trim();
     if (!name) throw new Error('项目名称不能为空');
     const project = {
@@ -69,6 +69,8 @@ export class Store {
       maxHops: clampInt(maxHops, 1, 100, 12),
       ackTimeoutSec: clampInt(ackTimeoutSec, 5, 3600, 60),
       paused: false,
+      barkUrl: normBarkUrl(barkUrl),
+      barkSound: normSound(barkSound),
       agents: this.validateAgents(agents),
       createdAt: Date.now(),
     };
@@ -86,6 +88,8 @@ export class Store {
     if (patch.maxHops !== undefined) p.maxHops = clampInt(patch.maxHops, 1, 100, p.maxHops);
     if (patch.ackTimeoutSec !== undefined) p.ackTimeoutSec = clampInt(patch.ackTimeoutSec, 5, 3600, p.ackTimeoutSec ?? 60);
     if (patch.paused !== undefined) p.paused = !!patch.paused;
+    if (patch.barkUrl !== undefined) p.barkUrl = normBarkUrl(patch.barkUrl);
+    if (patch.barkSound !== undefined) p.barkSound = normSound(patch.barkSound);
     if (patch.agents !== undefined) {
       // 保留已有 agent 的 token
       const old = new Map(p.agents.map((a) => [a.name.toLowerCase(), a.token]));
@@ -129,6 +133,28 @@ export class Store {
     fs.appendFileSync(this.msgFile(projectId), JSON.stringify(msg) + '\n');
     return msg;
   }
+}
+
+/** Bark 推送地址：https://api.day.app/<key>（粘贴了带示例内容的完整链接也只取 key 部分） */
+export function normBarkUrl(v) {
+  v = String(v || '').trim();
+  if (!v) return '';
+  let u;
+  try {
+    u = new URL(v);
+  } catch {
+    throw new Error('Bark 推送地址格式不对，应类似 https://api.day.app/你的key');
+  }
+  if (!/^https?:$/.test(u.protocol)) throw new Error('Bark 推送地址必须是 http(s) 链接');
+  const segs = u.pathname.split('/').filter(Boolean);
+  if (u.hostname === 'api.day.app') {
+    if (!segs.length) throw new Error('Bark 推送地址缺少 key');
+    return `${u.origin}/${segs[0]}`;
+  }
+  return `${u.origin}/${segs.join('/')}`.replace(/\/$/, '');
+}
+function normSound(v) {
+  return String(v || 'birdsong').trim().replace(/[^\w.-]/g, '').slice(0, 40) || 'birdsong';
 }
 
 function clampInt(v, min, max, def) {

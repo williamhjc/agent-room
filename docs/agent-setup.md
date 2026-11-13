@@ -67,6 +67,10 @@ node ~/.agent-room/bin/connector.js \
 | `--model <模型>` | 指定模型 |
 | `--dry-run` | 不调用 CLI，只回显消息，用来测试连通性 |
 
+### 请用户验收（手机推送）
+
+项目里配置了 Bark 推送地址后，agent 回复的第一行写【待验收】，用户手机就会收到通知。连接器模式的提示词里已经写好了这条规则，不用另外交代。会话模式用 `room send --review "做了什么 / 怎么验收 / 已知问题"`。
+
 ### 额度用完怎么办（自动处理）
 
 Claude / Codex 的额度用完或被限流时，连接器会：
@@ -113,7 +117,7 @@ room wait  →  干活  →  room send "结果"  →  room wait  → …
 | 命令 | 作用 |
 |---|---|
 | `room wait` | 等下一条 @我 的消息（收到后自动回执"已接单"） |
-| `room send "内容"` | 发消息；`--attach 图.png` 附图片/文件 |
+| `room send "内容"` | 发消息；`--attach 图.png` 附图片/文件；`--review` 请用户验收（推送到用户手机） |
 | `room inbox` | 看上次之后的新消息（干活中途确认需求有没有变） |
 | `room who` | 看成员和在线状态 |
 | `room show <id>` / `room get <附件URL>` | 看长消息全文 / 下载附件 |

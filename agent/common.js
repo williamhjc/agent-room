@@ -15,7 +15,7 @@ if (!WSImpl) {
 export const WS = WSImpl;
 
 /** 解析命令行：--k v、--flag、可重复的 --attach，以及位置参数 */
-export function parseArgs(argv, repeatable = [], valueKeys = []) {
+export function parseArgs(argv, repeatable = [], valueKeys = [], flags = []) {
   const out = { _: [] };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -37,7 +37,7 @@ export function parseArgs(argv, repeatable = [], valueKeys = []) {
     } else {
       const next = argv[i + 1];
       // valueKeys 中的参数总是吃掉下一个值（例如 --extra "--allowedTools Bash"）
-      if (next === undefined || (next.startsWith('--') && !valueKeys.includes(key))) val = true;
+      if (next === undefined || flags.includes(key) || (next.startsWith("--") && !valueKeys.includes(key))) val = true; // flags 是开关，不吃后面的值
       else {
         val = next;
         i++;

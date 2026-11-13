@@ -95,6 +95,24 @@
         <label>Agent 自动接力上限<input class="input" name="maxHops" type="number" min="1" max="100" value="12" /></label>
       </div>
       <label>派活后多少秒无人接单就在群里提醒（5-3600）<input class="input" name="ackTimeoutSec" type="number" min="5" max="3600" value="60" /></label>
+      <div class="bark-row">
+        <label class="bark-url">验收通知 · Bark 推送地址（agent 发出【待验收】时推送到手机，留空不推送）
+          <input class="input" name="barkUrl" placeholder="https://api.day.app/你的key" autocomplete="off" spellcheck="false" />
+        </label>
+        <label class="bark-sound">音效
+          <select class="input" name="barkSound">
+            <option>birdsong</option><option>alarm</option><option>anticipate</option><option>bell</option><option>bloom</option>
+            <option>calypso</option><option>chime</option><option>choo</option><option>descent</option><option>electronic</option>
+            <option>fanfare</option><option>glass</option><option>gotosleep</option><option>healthnotification</option><option>horn</option>
+            <option>ladder</option><option>mailsent</option><option>minuet</option><option>multiwayinvitation</option><option>newmail</option>
+            <option>newsflash</option><option>noir</option><option>paymentsuccess</option><option>shake</option><option>sherwoodforest</option>
+            <option>silence</option><option>spell</option><option>suspense</option><option>telegraph</option><option>tiptoes</option>
+            <option>typewriters</option><option>update</option>
+          </select>
+        </label>
+        <button type="button" class="btn" id="btnBarkTest">测试推送</button>
+      </div>
+      <div class="hint" id="barkHint"></div>
       <label>项目说明 / 目标<textarea class="input" name="description" rows="3" placeholder="项目背景、目标、技术栈、约束……所有 agent 都会看到"></textarea></label>
       <label>默认工作目录（连接器命令中的 --workdir，可在各机器上自行修改）<input class="input" name="workdir" placeholder="例如：D:\code\shop 或 /srv/shop" /></label>
       <div class="roles-head">
