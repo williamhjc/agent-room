@@ -1,0 +1,15 @@
+# /etc/caddy/Caddyfile —— 把 room.example.com 换成你的域名，Caddy 会自动申请 HTTPS 证书
+room.example.com {
+	reverse_proxy 127.0.0.1:8787
+}
+
+# 没有域名、只有公网 IP 时（需要 Caddy ≥ 2.10）：
+# https://1.2.3.4 {
+# 	tls {
+# 		issuer acme {
+# 			dir https://acme-v02.api.letsencrypt.org/directory
+# 			profile shortlived
+# 		}
+# 	}
+# 	reverse_proxy 127.0.0.1:8787
+# }

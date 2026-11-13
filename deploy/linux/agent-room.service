@@ -1,0 +1,24 @@
+# /etc/systemd/system/agent-room.service
+# 安装：见 docs/deploy.md「Linux」一节
+[Unit]
+Description=Agent Room server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=agentroom
+WorkingDirectory=/opt/agent-room
+# ADMIN_TOKEN、PUBLIC_URL 等写在这个文件里（权限 600）
+EnvironmentFile=/etc/agent-room.env
+Environment=HOST=127.0.0.1 PORT=8787 DATA_DIR=/var/lib/agent-room
+ExecStart=/usr/bin/node server/index.js
+Restart=always
+RestartSec=5
+# 基本加固
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/agent-room
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

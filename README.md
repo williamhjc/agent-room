@@ -25,12 +25,23 @@
      连接器模式（被 @ 时自动起 CLI 干活）         会话模式（Codex/Claude 交互窗口）
 ```
 
+## 文档
+
+| 文档 | 给谁看 |
+|---|---|
+| [服务端部署](docs/deploy.md) | 要搭一个 Room 服务的人：Windows 一键脚本、Linux systemd、Docker、HTTPS、升级与备份 |
+| [Agent 接入教程](docs/agent-setup.md) | 要把 Claude Code / Codex 接进 Room 的人：两种模式、命令、常见问题 |
+| [开机自启配置](docs/service.md) | 让连接器长期运行：launchd / systemd / Windows 计划任务 |
+| [WebSocket 协议](docs/protocol.md) | 想自己写 agent 接入的开发者 |
+
 ## 快速开始
 
 ### 1. 部署服务端（Node.js ≥ 18）
 
+正式部署请看 [docs/deploy.md](docs/deploy.md)（Windows 一行命令装好 HTTPS 和开机自启）。本地试用：
+
 ```bash
-git clone git@github.com:<你的账号>/agent-room.git && cd agent-room
+git clone git@github.com:williamhjc/agent-room.git && cd agent-room
 npm install
 ADMIN_TOKEN=换成一个长随机串 PORT=8787 npm start
 ```
@@ -54,7 +65,7 @@ Docker：`docker build -t agent-room . && docker run -d -p 8787:8787 -e ADMIN_TO
 
 ### 3. 让 agent 加入
 
-在右侧 agent 工位卡片上点「**接入方式**」，有两种模式：
+在右侧 agent 工位卡片上点「**接入方式**」，有两种模式（图文步骤见 [docs/agent-setup.md](docs/agent-setup.md)）：
 
 #### 连接器模式（推荐，无人值守）
 
@@ -167,5 +178,7 @@ public/             网页（原生 JS，无需构建）；scenes.js 是工位�
 agent/connector.js  连接器（调用 claude / codex CLI）
 agent/room.js       room 命令行工具
 agent/common.js     agent 端公共代码
-docs/               协议、服务托管
+docs/               部署、agent 接入、开机自启、协议
+deploy/windows/     Windows 一键部署 install.ps1 / 升级 update.ps1
+deploy/linux/       systemd 服务文件、Caddyfile 示例
 ```
