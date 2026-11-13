@@ -1,5 +1,5 @@
 // Agent 状态小剧场：头部是 Claude / Codex 图标，身体是简笔画，不同状态不同场景。
-// 场景：beach（空闲晒太阳睡觉）working（搬砖）fishing（等消息钓鱼）offline（帐篷睡觉）error（电脑冒烟）
+// 场景：beach（空闲晒太阳睡觉）working（搬砖）fishing（等消息钓鱼）quota（额度用完，抱电池充电）offline（帐篷睡觉）error（电脑冒烟）
 
 /** 头像图标（引用 index.html 里的 <symbol>） */
 export function headIcon(type, label = '') {
@@ -16,6 +16,7 @@ const head = (type, x, y, size, cls = '') =>
 export function sceneState(st) {
   if (!st || !st.online) return 'offline';
   if (st.status === 'error') return 'error';
+  if (st.status === 'quota') return 'quota';
   if (st.status === 'working') return 'working';
   if (st.mode === 'session' && st.listening) return 'fishing';
   return 'beach';
@@ -32,9 +33,24 @@ export function sceneCaption(state, st) {
       return '空闲，在沙滩上打盹。@它就开工';
     case 'error':
       return `电脑冒烟了${note}`;
+    case 'quota':
+      return `额度用完，抱着电池充电中${st?.until ? `（${untilText(st.until)}）` : ''}。消息会排队，恢复后自动接着干`;
     default:
       return st?.pending ? '离线，在帐篷里睡觉——有消息等它上线' : '离线，在帐篷里睡觉';
   }
+}
+
+/** 预计恢复时间："预计 15:00 恢复 · 还有 2 小时 5 分" */
+export function untilText(until) {
+  const left = until - Date.now();
+  if (left <= 0) return '正在重试';
+  const d = new Date(until);
+  const sameDay = d.toDateString() === new Date().toDateString();
+  const hm = d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false });
+  const clock = sameDay ? hm : `${d.getMonth() + 1}/${d.getDate()} ${hm}`;
+  const min = Math.ceil(left / 60_000);
+  const rel = min < 60 ? `${min} 分钟` : min < 2880 ? `${Math.floor(min / 60)} 小时${min % 60 ? ` ${min % 60} 分` : ''}` : `${Math.round(min / 1440)} 天`;
+  return `预计 ${clock} 恢复 · 还有 ${rel}`;
 }
 
 function mailOverlay(n, working) {
@@ -235,7 +251,54 @@ function error(type) {
   <path d="M190 14 L204 38 H176 Z" fill="#ff4d6d" class="blink"/><text x="190" y="34" text-anchor="middle" font-size="12" font-weight="800" fill="#fff">!</text>`;
 }
 
-const SCENES = { beach, working, fishing, offline, error };
+function quota(type) {
+  return `
+  <defs>
+    <linearGradient id="sky-quota" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1a1240"/><stop offset="1" stop-color="#2d2466"/>
+    </linearGradient>
+  </defs>
+  <rect width="220" height="120" fill="url(#sky-quota)"/>
+  <rect y="100" width="220" height="20" fill="#1d1640"/>
+  <!-- 墙上的钟：等恢复 -->
+  <circle cx="40" cy="30" r="13" fill="#2a2160" stroke="#a78bfa" stroke-width="1.6"/>
+  <line x1="40" y1="30" x2="40" y2="21" stroke="#e8e2ff" stroke-width="1.6" stroke-linecap="round" class="clock-min" style="transform-origin:40px 30px"/>
+  <line x1="40" y1="30" x2="46" y2="30" stroke="#e8e2ff" stroke-width="1.8" stroke-linecap="round"/>
+  <!-- 插座和电线 -->
+  <rect x="196" y="70" width="12" height="16" rx="2" fill="#3a3270" stroke="#7c6fd0"/>
+  <circle cx="200" cy="78" r="1.2" fill="#1a1240"/><circle cx="204" cy="78" r="1.2" fill="#1a1240"/>
+  <path d="M196 80 C180 80 186 104 160 100" stroke="#7c6fd0" stroke-width="2" fill="none"/>
+  <!-- 大电池 -->
+  <rect x="122" y="54" width="40" height="46" rx="5" fill="#120d2e" stroke="#a78bfa" stroke-width="2"/>
+  <rect x="134" y="49" width="16" height="6" rx="2" fill="#a78bfa"/>
+  <g class="charge">
+    <rect class="cb cb1" x="127" y="88" width="30" height="8" rx="1.5" fill="#34d399"/>
+    <rect class="cb cb2" x="127" y="78" width="30" height="8" rx="1.5" fill="#34d399"/>
+    <rect class="cb cb3" x="127" y="68" width="30" height="8" rx="1.5" fill="#34d399"/>
+    <rect class="cb cb4" x="127" y="58" width="30" height="8" rx="1.5" fill="#34d399"/>
+  </g>
+  <path class="bolt" d="M145 60 L136 78 H143 L139 94 L150 72 H143 Z" fill="#ffd166" stroke="#b8860b" stroke-width=".6"/>
+  <!-- 抱着电池打盹的小人 -->
+  <g stroke="#e8eefc" stroke-width="3" ${STICK}>
+    <line x1="96" y1="68" x2="98" y2="90"/>
+    <polyline points="98,90 112,92 118,100"/>
+    <polyline points="98,90 88,98 84,100"/>
+    <polyline points="97,74 110,72 124,70"/>
+    <polyline points="97,76 108,82 124,84"/>
+  </g>
+  <g class="nod" style="transform-origin:96px 66px">${head(type, 82, 40, 26)}</g>
+  <!-- 咖啡 -->
+  <path d="M60 90 h12 l-1.6 10 h-8.8z" fill="#f4f7ff" opacity=".9"/><path d="M72 92 q5 1 0 5" stroke="#f4f7ff" fill="none" stroke-width="1.4"/>
+  <g class="steam" stroke="#c4b5fd" stroke-width="1.2" fill="none" opacity=".7"><path class="p p1" d="M64 86 q-2 -4 0 -8"/><path class="p p2" d="M68 86 q2 -4 0 -8"/></g>
+  <g class="zzz" font-weight="700" fill="#c4b5fd">
+    <text class="z z1" x="106" y="40" font-size="8">z</text>
+    <text class="z z2" x="112" y="33" font-size="10">z</text>
+  </g>
+  <rect x="8" y="104" width="64" height="12" rx="6" fill="#2a2160" stroke="#a78bfa" stroke-width=".8"/>
+  <text x="40" y="112.5" text-anchor="middle" font-size="7.5" fill="#e8e2ff" font-weight="700">额度充电中</text>`;
+}
+
+const SCENES = { beach, working, fishing, offline, error, quota };
 
 export function sceneSVG(type, state, st) {
   const body = (SCENES[state] || offline)(type);

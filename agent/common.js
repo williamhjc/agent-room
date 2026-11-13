@@ -218,3 +218,76 @@ export async function uploadFile(conn, filePath) {
   if (!res.ok) throw new Error(`上传 ${name} 失败：${data.error || res.status}`);
   return data.attachment;
 }
+
+// ---------- 模型额度用完 / 限流识别 ----------
+// 只在 CLI 报错时调用（正常输出里谈到 "rate limit" 不算）。返回 { until, transient, text } 或 null。
+const LIMIT_RE =
+  /usage limit|hit your (?:usage )?limit|limit (?:reached|exceeded)|rate[ _-]?limit|quota|too many requests|\b429\b|insufficient_quota|overloaded|\b529\b|额度|限额|用量上限/i;
+const TRANSIENT_RE = /overloaded|\b529\b|too many requests|\b429\b/i;
+export function detectLimit(text, now = Date.now()) {
+  text = String(text || '');
+  if (!LIMIT_RE.test(text)) return null;
+  const transient = TRANSIENT_RE.test(text) && !/usage limit|hit your|quota|额度/i.test(text);
+  let until = parseReset(text, now);
+  if (until && (until < now || until > now + 8 * 86400_000)) until = null;
+  return { until, transient, text: text.replace(/\s+/g, ' ').trim().slice(0, 240) };
+}
+/** CLI 正常退出但结果本身就是一句额度提示（旧版 claude -p 会这样） */
+export function looksLikeLimitResult(text) {
+  const t = String(text || '').trim();
+  return t.length < 400 && /usage limit reached|hit your (?:usage )?limit|limit reached\s*[·∙•|-]\s*resets/i.test(t);
+}
+
+/** 墙上时间 h:m 在时区 tz 下、now 之后最近的一次 */
+function nextWallClock(h, min, tz, now) {
+  let offset = 0; // tz 相对本机的偏移
+  if (tz) {
+    try {
+      const d = new Date(now);
+      const inTz = new Date(d.toLocaleString('en-US', { timeZone: tz }));
+      const local = new Date(d.toLocaleString('en-US'));
+      offset = inTz - local;
+    } catch {}
+  }
+  const d = new Date(now + offset);
+  d.setHours(h, min, 0, 0);
+  let t = d.getTime() - offset;
+  if (t <= now) t += 86400_000;
+  return t;
+}
+
+export function parseReset(text, now = Date.now()) {
+  let m;
+  // Claude 旧格式：Claude AI usage limit reached|1731500000
+  if ((m = text.match(/\|(\d{10})\b/))) return +m[1] * 1000;
+  if ((m = text.match(/retry[- ]after[:\s]+(\d+)\s*(?:s|sec|secs|seconds)?\b/i))) return now + +m[1] * 1000;
+  // try again in 2 days 3 hours / in 45 minutes / 5h 3m
+  if ((m = text.match(/\bin\s+((?:\d+\s*(?:days?|d|hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)\b[\s,]*(?:and\s+)?)+)/i))) {
+    let ms = 0;
+    for (const [, n, u] of m[1].matchAll(/(\d+)\s*([a-z]+)/gi)) {
+      const k = u[0].toLowerCase();
+      ms += +n * (k === 'd' ? 86400e3 : k === 'h' ? 3600e3 : k === 'm' ? 60e3 : 1e3);
+    }
+    if (ms) return now + ms;
+  }
+  const lead = /(?:try again at|resets?(?:\s+at)?|reset at|available (?:again )?at)\s+/.source;
+  // 带日期：try again at Nov 20th, 2026 9:00 AM
+  const dateRe = /([A-Z][a-z]{2,8}\.? \d{1,2}(?:st|nd|rd|th)?,?(?: \d{4})?,?(?: at)? \d{1,2}(?::\d{2})?\s*(?:[ap]\.?m\.?)?)/.source;
+  if ((m = text.match(new RegExp(lead + dateRe, 'i')))) {
+    let s = m[1].replace(/(\d)(st|nd|rd|th)/i, '$1').replace(/ at /i, ' ').replace(/(\d)\s*([ap])\.?m\.?/i, '$1 $2M');
+    if (!/\d{4}/.test(s)) s = s.replace(/^([A-Za-z]+\.? \d{1,2}),?/, `$1, ${new Date(now).getFullYear()}`);
+    const t = Date.parse(s);
+    if (!isNaN(t)) return t < now - 3600e3 ? t + 365 * 86400e3 : t;
+  }
+  // 只有时刻：try again at 9:41 PM / resets 3pm (Asia/Shanghai) / resets at 15:00
+  const timeRe = /(\d{1,2})(?::(\d{2}))?\s*(?:([ap])\.?m\.?)?(?:\s*\(([A-Za-z_]+(?:\/[A-Za-z_+-]+)+|UTC)\))?/.source;
+  if ((m = text.match(new RegExp(lead + timeRe, 'i')))) {
+    let h = +m[1];
+    const min = +(m[2] || 0);
+    const ap = m[3]?.toLowerCase();
+    if (ap === 'p' && h < 12) h += 12;
+    if (ap === 'a' && h === 12) h = 0;
+    if (h < 24 && min < 60 && (ap || m[2])) return nextWallClock(h, min, m[4], now);
+  }
+  return null;
+}

@@ -5,14 +5,14 @@
 // 用法：
 //   node agent/connector.js --server ws://HOST:8787/ws --project <ID> --agent <名称> --token <TOKEN> \
 //        [--workdir 路径] [--cli claude|codex] [--bin 可执行文件] [--permission 模式] [--yolo] \
-//        [--model 模型] [--extra "额外参数"] [--timeout 分钟] [--history 条数]
+//        [--model 模型] [--extra "额外参数"] [--timeout 分钟，默认 720] [--limit-retry 分钟] [--history 条数]
 // 连接信息也可以来自环境变量 AGENT_ROOM_* 或当前目录的 .agent-room.json（room init 生成）。
 import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { WS, parseArgs, loadConn, httpBase, stateDir, readState, updateState, fmtMessage, ensureRoomShim } from './common.js';
+import { WS, parseArgs, loadConn, httpBase, stateDir, readState, updateState, fmtMessage, ensureRoomShim, detectLimit, looksLikeLimitResult } from './common.js';
 
 const ROOM_TOOL = path.join(path.dirname(fileURLToPath(import.meta.url)), 'room.js');
 const SHIM_DIR = ensureRoomShim(ROOM_TOOL); // 提供 `room` 短命令给 CLI 子进程
@@ -31,7 +31,9 @@ const cfg = {
   yolo: !!(args.yolo || env.AGENT_ROOM_YOLO === '1'),
   model: args.model || env.AGENT_ROOM_MODEL || '',
   extra: String(args.extra || env.AGENT_ROOM_EXTRA || '').split(/\s+/).filter(Boolean),
-  timeoutMin: parseFloat(args.timeout || env.AGENT_ROOM_TIMEOUT || '30'),
+  // 单次任务上限（分钟）。默认 12 小时，只用来兜底卡死的进程；0 为不限制
+  timeoutMin: parseFloat(args.timeout ?? env.AGENT_ROOM_TIMEOUT ?? '720'),
+  limitRetryMin: parseFloat(args['limit-retry'] || env.AGENT_ROOM_LIMIT_RETRY || '30'), // 额度用完但不知道何时恢复时，多久重试一次
   backlogHours: parseFloat(args['backlog-hours'] || env.AGENT_ROOM_BACKLOG_HOURS || '24'),
   historyN: parseInt(args.history || env.AGENT_ROOM_HISTORY || '40', 10),
   noResume: !!args['no-resume'],
@@ -64,11 +66,14 @@ let currentTriggers = [];
 let runNote = '';
 let backoff = 1000;
 let lastPong = Date.now();
+// 额度用完：state.limited = { until, guessed, reason, since, ids, notified }，持久化，重启后继续等
+let limitTimer = null;
 
 function send(data) {
   if (ws && ws.readyState === 1) ws.send(JSON.stringify(data));
 }
 function setStatus(status, note = '') {
+  if (status === 'idle' && isLimited()) return quotaStatus();
   send({ type: 'status', status, note });
 }
 
@@ -127,7 +132,7 @@ function onServer(data) {
       log(`已加入项目「${project.name}」，角色：${self.type} — ${self.role.slice(0, 60) || '（未定义）'}`);
       log(`工作目录：${cfg.workdir}`);
       // 补处理：服务端记录的未接单派发 + 已处理游标之后 1 小时内 @ 我的消息
-      const pendIds = new Set(data.pending || []);
+      const pendIds = new Set([...(data.pending || []), ...(state.limited?.ids || [])]);
       const doneTs = state.doneTs || 0;
       const backlog = history.filter(
         (m) =>
@@ -139,6 +144,11 @@ function onServer(data) {
       if (backlog.length) {
         log(`发现 ${backlog.length} 条未处理的 @ 消息`);
         pending.push(...backlog);
+      }
+      if (state.limited) {
+        // 重启前在等额度恢复：继续等（时间已过就直接重试）
+        if (isLimited()) log(`额度用完，等待恢复（预计 ${fmtClock(state.limited.until)}）`);
+        scheduleLimitRetry();
       }
       setStatus(running ? 'working' : 'idle');
       pump();
@@ -155,7 +165,17 @@ function onServer(data) {
       if (isForMe(m)) {
         log(`被 @：${m.from}: ${m.text.slice(0, 80)}`);
         pending.push(m);
-        if (running) {
+        if (isLimited() && !running) {
+          // 额度用完：先确认收到并排队；用户亲自 @ 时立即试一次（可能已经换了账号或额度提前恢复）
+          send({ type: 'ack', ids: [m.id] });
+          if (m.fromType === 'user') {
+            log('用户 @ 我，立即重试一次');
+            state.limited.until = Date.now();
+          } else {
+            log(`额度用完，消息排队（${pending.length} 条）`);
+            quotaStatus();
+          }
+        } else if (running) {
           // 排队情况实时反映到群成员状态上（网页能看到"排队 N 条"）
           log(`正在执行任务，排队 ${pending.length} 条`);
           setStatus('working', `${runNote} · 排队 ${pending.length} 条`);
@@ -171,6 +191,11 @@ function onServer(data) {
         pending = [];
         if (dropped.length) send({ type: 'ack', ids: dropped.map((m) => m.id) });
         if (killRunning()) post('（已按用户要求中止当前任务）');
+        else if (state.limited && dropped.length) {
+          post(`（已按用户要求清空等待额度恢复的 ${dropped.length} 条任务）`);
+          saveState({ limited: { ...state.limited, ids: [] } });
+          quotaStatus();
+        }
       } else if (data.action === 'reset') {
         log(`${data.by} 请求重置会话`);
         saveState({ sessionId: null, primed: false });
@@ -194,6 +219,7 @@ function post(text, replyTo) {
 // ---------- 任务处理 ----------
 async function pump() {
   if (running || !pending.length || !project || !ws || ws.readyState !== 1) return;
+  if (isLimited()) return; // 等额度恢复，到点由 scheduleLimitRetry 再叫醒
   // 执行期间 CLI 已经通过 room inbox 看到（并确认）的消息，不再单独开一轮
   const seenByChild = readState(conn).seenTs || 0;
   const skipped = pending.filter((m) => m.ts <= seenByChild && state.lastRunEnd && m.ts > state.lastRunStart);
@@ -214,10 +240,24 @@ async function pump() {
   let reply;
   try {
     reply = await runCli(prompt);
+    if (state.limited) {
+      log('额度已恢复');
+      const wasNotified = state.limited.notified;
+      clearLimit();
+      if (wasNotified) reply = `✅ 额度已恢复，接着处理之前排队的任务。\n\n${reply}`;
+    }
   } catch (e) {
+    if (e.limit) {
+      // 额度用完：任务放回队列，到点自动重试；不推进已处理游标
+      running = null;
+      currentTriggers = [];
+      pending = [...triggers, ...pending.filter((m) => !triggers.includes(m))];
+      enterLimit(e.limit, triggers);
+      return;
+    }
     log('执行失败：', e.message);
     if (e.timedOut) {
-      reply = `⚠️ 这次任务执行超过 ${cfg.timeoutMin} 分钟，被连接器终止（--timeout 上限），结果可能不完整。需要继续请再 @我（会接着上次的会话），或调大连接器的 --timeout（0 为不限制）。`;
+      reply = `⚠️ 这次任务执行超过 ${fmtDuration(cfg.timeoutMin * 60_000)}，被连接器终止（--timeout 上限），结果可能不完整。需要继续请再 @我（会接着上次的会话），或调大连接器的 --timeout（0 为不限制）。`;
     } else reply = e.cancelled ? null : `⚠️ 执行出错：${e.message.slice(0, 1500)}`;
     setStatus('error', e.message.slice(0, 120));
   }
@@ -227,6 +267,85 @@ async function pump() {
   currentTriggers = [];
   setStatus('idle');
   setImmediate(pump);
+}
+
+// ---------- 额度用完 / 限流 ----------
+function isLimited() {
+  return !!state.limited && Date.now() < state.limited.until;
+}
+const fmtClock = (t) => new Date(t).toLocaleString('zh-CN', { hour12: false, month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+function fmtDuration(ms) {
+  const min = Math.max(1, Math.round(ms / 60_000));
+  if (min < 60) return `${min} 分钟`;
+  const h = Math.floor(min / 60);
+  if (h < 48) return `${h} 小时${min % 60 ? ` ${min % 60} 分钟` : ''}`;
+  return `${Math.round(h / 24)} 天`;
+}
+function quotaStatus() {
+  const l = state.limited;
+  if (!l) return;
+  const q = pending.length ? ` · 排队 ${pending.length} 条` : '';
+  const when = l.guessed ? `恢复时间未知，${fmtDuration(Math.max(0, l.until - Date.now()))}后重试` : `预计 ${fmtClock(l.until)} 恢复`;
+  send({ type: 'status', status: 'quota', note: `额度用完 · ${when}${q}`, until: l.until });
+}
+function enterLimit(info, triggers) {
+  const now = Date.now();
+  const first = !state.limited;
+  const retryMin = info.transient ? 5 : cfg.limitRetryMin;
+  // 官方给的恢复时间多留 1 分钟余量（很短的限流只留 1 秒）
+  const until = info.until ? info.until + (info.until - now > 300_000 ? 60_000 : 1000) : now + retryMin * 60_000;
+  const ids = [...new Set([...(state.limited?.ids || []), ...pending.map((m) => m.id)])].slice(-50);
+  saveState({
+    limited: { until, guessed: !info.until, reason: info.text, since: state.limited?.since || now, ids, notified: state.limited?.notified || false },
+  });
+  log(`额度用完 / 限流：${info.text}；${fmtClock(until)} 重试`);
+  // 第一次碰到时在群里说一声；之后重试仍失败只更新状态，不刷屏。短暂限流（429/过载）先静默重试一次
+  if (first && !info.transient) announceLimit(triggers);
+  else if (!first && !state.limited.notified && now - state.limited.since > 10 * 60_000) announceLimit(triggers);
+  quotaStatus();
+  scheduleLimitRetry();
+}
+function announceLimit(triggers) {
+  const l = state.limited;
+  const cliName = agentCli() === 'codex' ? 'Codex' : 'Claude';
+  // 把这件事告诉派活给我的 agent，让它先做别的，不要干等
+  const askers = [...new Set(triggers.filter((m) => m.fromType === 'agent' && m.from !== cfg.agent).map((m) => m.from))];
+  const when = l.guessed
+    ? `恢复时间未知，我每 ${fmtDuration(l.until - Date.now())}自动重试一次`
+    : `预计 ${fmtClock(l.until)} 恢复（${fmtDuration(l.until - Date.now())}后）`;
+  const text = [
+    `⏳ 我的 ${cliName} 模型额度暂时用完了，${when}。`,
+    `手上的 ${pending.length} 条任务已保留，额度恢复后会自动接着做，完成后照常在群里回复。`,
+    askers.length
+      ? `${askers.map((a) => '@' + a).join(' ')} 先不用等我，请推进不依赖我的工作；必须由我做的部分留到恢复后。`
+      : '其他成员先不用等我，可以推进不依赖我的工作。',
+  ].join('\n');
+  send({ type: 'message', text, replyTo: triggers.at(-1)?.id, meta: { kind: 'quota', until: l.until } });
+  saveState({ limited: { ...l, notified: true } });
+}
+function clearLimit() {
+  clearTimeout(limitTimer);
+  limitTimer = null;
+  saveState({ limited: null });
+}
+function scheduleLimitRetry() {
+  clearTimeout(limitTimer);
+  if (!state.limited) return;
+  const wait = Math.max(1000, Math.min(state.limited.until - Date.now(), 2 ** 31 - 1));
+  limitTimer = setTimeout(() => {
+    limitTimer = null;
+    if (!state.limited) return;
+    if (Date.now() < state.limited.until) return scheduleLimitRetry();
+    if (!pending.length && !running) {
+      // 没有等着的任务了，认为已恢复（下次真用到时再判断）
+      log('额度等待期结束，没有排队任务');
+      clearLimit();
+      setStatus('idle');
+      return;
+    }
+    log('到达预计恢复时间，重试排队的任务');
+    pump();
+  }, wait);
 }
 
 const fmt = (m) => fmtMessage(m, { base, me: cfg.agent, maxLen: 3000 });
@@ -255,7 +374,8 @@ function buildPrompt(triggers) {
 4. 用户（人类）是最终决策者。需求不明确或有重大取舍时，直接在群里向用户提问，不要 @agent。
 5. 只做你分工内的事；在当前工作目录中直接读写代码、运行命令来完成任务，完成后简要汇报改了什么、结果如何。
 6. 只用你自己的身份 @${cfg.agent} 发言，绝不冒充用户或其他成员。
-7. 截图等图片用 room send --attach 发送，不要把 base64 贴进消息。`;
+7. 截图等图片用 room send --attach 发送，不要把 base64 贴进消息。
+8. 如果群里提示某个成员"额度用完"，不要干等或反复 @它：先推进不依赖它的工作，必须由它做的部分等它恢复后自己接着做。`;
 
   const resumed = state.primed && state.sessionId && !cfg.noResume;
   if (resumed) {
@@ -383,7 +503,24 @@ function exec(bin, argv, input) {
   });
 }
 
+const simulatedLimits = new Set();
+function throwIfLimit(text) {
+  const info = detectLimit(text);
+  if (!info) return;
+  const e = new Error(`额度用完 / 限流：${info.text}`);
+  e.limit = info;
+  throw e;
+}
+
 async function runCli(prompt) {
+  // 联调用：--dry-run 时消息里带 [模拟额度用完] 就假装碰到额度上限
+  if (cfg.dryRun) {
+    const t = currentTriggers.find((m) => /\[模拟额度用完(:\d+)?\]/.test(m.text) && !simulatedLimits.has(m.id));
+    if (t) {
+      simulatedLimits.add(t.id);
+      throwIfLimit(`You've hit your usage limit. Try again in ${t.text.match(/\[模拟额度用完:(\d+)\]/)?.[1] || 3} seconds.`);
+    }
+  }
   if (cfg.dryRun) {
     await new Promise((r) => setTimeout(r, 800));
     return `（dry-run）我是 @${cfg.agent}，收到：${prompt.split('【需要你处理的消息】')[1]?.trim().slice(0, 300)}`;
@@ -408,6 +545,9 @@ async function runClaude(prompt, allowResume = true) {
   try {
     out = JSON.parse(stdout.trim().split('\n').filter(Boolean).pop());
   } catch {}
+  // 额度用完 / 限流：先于"续接失败重试"判断，避免白白丢掉会话
+  const errText = out ? (out.is_error ? `${out.result || ''} ${out.subtype || ''}` : looksLikeLimitResult(out.result) ? out.result : '') : `${stderr}\n${stdout}`;
+  if (errText) throwIfLimit(errText);
   if (!out) {
     if (resume) {
       log('续接会话失败，改用新会话重试');
@@ -441,6 +581,7 @@ async function runCodex(prompt, allowResume = true) {
   const { code, stdout, stderr } = await exec(bin, argv, prompt);
   let threadId = null;
   let lastAgentMsg = '';
+  let errEvents = '';
   for (const line of stdout.split('\n')) {
     if (!line.trim().startsWith('{')) continue;
     try {
@@ -448,9 +589,14 @@ async function runCodex(prompt, allowResume = true) {
       threadId = ev.thread_id || ev.session_id || ev.msg?.session_id || threadId;
       const item = ev.item || ev.msg;
       if (item && (item.type === 'agent_message' || item.item_type === 'agent_message') && item.text) lastAgentMsg = item.text;
+      // 出错事件：{type:'error',message} / {type:'turn.failed',error:{message}} / 旧版 {msg:{type:'error',message}}
+      if (ev.type === 'error' || ev.type === 'turn.failed' || ev.msg?.type === 'error' || ev.msg?.type === 'stream_error')
+        errEvents += ` ${ev.message || ev.error?.message || ev.msg?.message || JSON.stringify(ev.error || '')}`;
     } catch {}
   }
   const result = fs.existsSync(outFile) ? fs.readFileSync(outFile, 'utf8') : lastAgentMsg;
+  if (errEvents && (code !== 0 || !result.trim())) throwIfLimit(errEvents);
+  if (code !== 0 && !result.trim()) throwIfLimit(stderr);
   if (code !== 0 && !result.trim()) {
     if (resume) {
       log('续接会话失败，改用新会话重试');

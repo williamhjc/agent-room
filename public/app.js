@@ -296,7 +296,7 @@ function messageEl(m) {
   if (m.fromType === 'system') {
     el.className = 'msg system';
     const k = m.meta?.kind;
-    el.innerHTML = `<div class="sys ${k === 'ack-timeout' ? 'warn' : k === 'ack-late' ? 'ok' : ''}">${esc(m.text)}</div>`;
+    el.innerHTML = `<div class="sys ${k === 'ack-timeout' ? 'warn' : k === 'ack-late' ? 'ok' : k === 'quota' ? 'quota' : ''}">${esc(m.text)}</div>`;
     return el;
   }
   const isMe = m.fromType === 'user';
@@ -304,7 +304,7 @@ function messageEl(m) {
   const t = new Date(m.ts);
   const time = t.toLocaleString('zh-CN', { hour12: false, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
   const parent = m.replyTo && S.messages.find((x) => x.id === m.replyTo);
-  el.className = `msg ${isMe ? 'me' : `agent-${type}`}`;
+  el.className = `msg ${isMe ? 'me' : `agent-${type}`}${m.meta?.kind === 'quota' ? ' quota-msg' : ''}`;
   el.innerHTML = `
     <div class="avatar ${type}" title="${esc(m.from)}">${headIcon(type, esc([...m.from][0] || '?'))}</div>
     <div class="msg-body">
@@ -408,7 +408,7 @@ function renderWorking() {
 }
 
 // ---------- 成员面板 ----------
-const STATUS_TEXT = { offline: '离线', idle: '在线 · 空闲', working: '工作中', error: '出错' };
+const STATUS_TEXT = { offline: '离线', idle: '在线 · 空闲', working: '工作中', error: '出错', quota: '额度用完 · 等待恢复' };
 const MODE_TEXT = { connector: '连接器', session: '交互会话' };
 // 卡片按 agent 复用；场景 SVG 只在状态变化时替换，避免每次在线状态更新都让动画重播
 const memberCards = new Map(); // name -> { el, sceneKey }
@@ -464,7 +464,7 @@ function renderMembers() {
     el.querySelector('.member-actions').innerHTML = `
       <button class="btn xs" data-act="at" data-name="${esc(a.name)}">@它</button>
       <button class="btn xs" data-act="connect" data-name="${esc(a.name)}">接入方式</button>
-      ${st.status === 'working' && st.mode === 'connector' ? `<button class="btn xs danger-text" data-act="cancel" data-name="${esc(a.name)}">中止</button>` : ''}
+      ${(st.status === 'working' || st.status === 'quota') && st.mode === 'connector' ? `<button class="btn xs danger-text" data-act="cancel" data-name="${esc(a.name)}" title="${st.status === 'quota' ? '清空等额度恢复的排队任务' : '中止当前任务'}">${st.status === 'quota' ? '清空排队' : '中止'}</button>` : ''}
       ${st.mode === 'connector' && st.listening ? `<button class="btn xs" data-act="reset" data-name="${esc(a.name)}" title="清空该 agent 的 CLI 会话上下文">重置会话</button>` : ''}`;
   }
 }
@@ -574,7 +574,7 @@ function renderConnCmd() {
   $('#connPrompt').textContent = sessionPrompt(connAgent, connOs);
   $('#connOpts').innerHTML =
     connMode === 'connector'
-      ? '可选参数：<code>--yolo</code> 跳过所有权限确认（全自动）、<code>--model</code> 指定模型、<code>--permission</code> 权限模式、<code>--timeout</code> 单次任务超时（分钟）、<code>--dry-run</code> 不调用 CLI 只回显（联调用）。'
+      ? '可选参数：<code>--yolo</code> 跳过所有权限确认（全自动）、<code>--model</code> 指定模型、<code>--permission</code> 权限模式、<code>--timeout</code> 单次任务上限（分钟，默认 720 即 12 小时，0 不限）、<code>--dry-run</code> 不调用 CLI 只回显（联调用）。'
       : '提示：会话做完一轮后如果没有再运行 room wait，派给它的消息超过「接单超时」后群里会出现黄色提醒，此时回到该会话让它继续 room wait 即可。';
   document.querySelectorAll('#connTabs .tab').forEach((t) => t.classList.toggle('active', t.dataset.os === connOs));
   document.querySelectorAll('#connModes .tab').forEach((t) => t.classList.toggle('active', t.dataset.mode === connMode));
@@ -918,4 +918,6 @@ async function boot() {
 }
 window.addEventListener('hashchange', route);
 setInterval(() => S.current || loadProjects().catch(() => {}), 15000);
+// 额度恢复倒计时
+setInterval(() => S.current && S.presence?.some((a) => a.status === 'quota') && renderMembers(), 30000);
 boot();

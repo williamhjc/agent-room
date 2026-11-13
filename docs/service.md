@@ -23,7 +23,6 @@
     <string>--agent</string><string><agent名></string>
     <string>--token</string><string><token></string>
     <string>--workdir</string><string>/Users/<你>/code/<项目></string>
-    <string>--timeout</string><string>60</string>
   </array>
   <!-- 让连接器能找到 codex / claude 命令 -->
   <key>EnvironmentVariables</key>
@@ -85,5 +84,5 @@ Register-ScheduledTask -TaskName "AgentRoom-<名>" -Action $action -Trigger $tri
 
 | 参数 | 说明 |
 |---|---|
-| `--timeout 60` | 单次任务上限（分钟），默认 30；`0` 为不限制。超时会在群里报告，而不是静默终止 |
+| `--timeout 720` | 单次任务上限（分钟），默认 720（12 小时），只用来兜底卡死的进程；`0` 为不限制。超时会在群里报告，而不是静默终止 |
 | `--backlog-hours 24` | 连接器重启后补处理多久以内的未处理 @，默认 24 小时（服务端记录的"待接单"不受此限制） |

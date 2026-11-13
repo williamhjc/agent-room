@@ -209,3 +209,54 @@ test('附件：伪造的附件 URL 会被丢弃，HTML 等类型强制下载', a
   assert.equal(m.attachments[0].url, up.attachment.url);
   user.ws.close();
 });
+
+test('额度识别：解析各家 CLI 的恢复时间', async () => {
+  const { detectLimit } = await import('../agent/common.js');
+  const now = Date.now();
+  assert.equal(detectLimit('Claude AI usage limit reached|1794560400', now).until, 1794560400000);
+  const inX = detectLimit("You've hit your usage limit. Try again in 2 days 3 hours 5 minutes.", now);
+  assert.equal(inX.until - now, ((2 * 24 + 3) * 60 + 5) * 60_000);
+  const at = detectLimit("You've hit your usage limit. Upgrade to Pro or try again at 9:41 PM.", now);
+  assert.equal(new Date(at.until).getHours(), 21);
+  assert.ok(at.until > now && at.until - now <= 86400_000);
+  const tz = detectLimit("You've hit your limit · resets 3pm (Asia/Shanghai)", now);
+  assert.equal(new Date(tz.until).toLocaleString('en-US', { timeZone: 'Asia/Shanghai', hour: 'numeric', hour12: false }), '15');
+  const ov = detectLimit('API Error: 529 {"type":"overloaded_error"}', now);
+  assert.ok(ov.transient && !ov.until);
+  assert.equal(detectLimit('Error: ENOENT no such file', now), null);
+});
+
+test('额度用完：连接器在群里说明并通知派活的 agent，消息排队，到点自动恢复继续', async () => {
+  const { project, tok } = await newProject(
+    [
+      { name: 'Alice', type: 'claude', role: '开发' },
+      { name: 'Bob', type: 'codex', role: '架构' },
+    ],
+    { ackTimeoutSec: 3 }
+  );
+  const user = await userClient(project.id);
+  start(['agent/connector.js', '--server', WSURL, '--project', project.id, '--agent', 'Alice', '--token', tok.Alice, '--workdir', path.join(tmp, 'wd2'), '--dry-run']);
+  await waitFor(() => user.presence.find((a) => a.name === 'Alice' && a.online));
+  const bobSay = (text) => exited(start(['agent/room.js', 'send', text], roomEnv(project, 'Bob', tok.Bob)));
+
+  assert.equal(await bobSay('@Alice [模拟额度用完:4] 实现登录接口'), 0);
+  const q = await waitFor(() => user.msgs.find((m) => m.from === 'Alice' && m.meta?.kind === 'quota'));
+  assert.match(q.text, /额度/);
+  assert.ok(q.dispatch.includes('Bob'), '应通知派活的 Bob 先做别的');
+  assert.ok(q.meta.until > Date.now());
+  await waitFor(() => user.presence.find((a) => a.name === 'Alice' && a.status === 'quota' && a.until));
+
+  // 额度用完期间再派活：服务端提醒，消息排队并已确认收到
+  assert.equal(await bobSay('@Alice 顺便把注册也做了'), 0);
+  const note = await waitFor(() => user.msgs.find((m) => m.fromType === 'system' && m.meta?.kind === 'quota'));
+  assert.match(note.text, /@Alice/);
+  await waitFor(() => user.presence.find((a) => a.name === 'Alice' && a.pending === 0));
+
+  // 到点重试成功：先说明已恢复，再处理排队的两条
+  const done = await waitFor(() => user.msgs.find((m) => m.from === 'Alice' && /额度已恢复/.test(m.text)), 15000);
+  assert.match(done.text, /实现登录接口/);
+  assert.match(done.text, /注册/);
+  await waitFor(() => user.presence.find((a) => a.name === 'Alice' && a.status === 'idle'));
+  assert.ok(!user.msgs.find((m) => m.meta?.kind === 'ack-timeout' && m.text.includes('@Alice')), '额度等待期间不应报 Alice 超时');
+  user.ws.close();
+});

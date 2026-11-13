@@ -91,8 +91,10 @@ function agentState(projectId, name) {
 function connsOf(st, ...modes) {
   return [...st.conns].filter((ws) => modes.includes(ws.ctx.mode));
 }
-function setAgentStatus(st, status, note = '') {
-  status = ['idle', 'working', 'error'].includes(status) ? status : 'idle';
+function setAgentStatus(st, status, note = '', until = null) {
+  status = ['idle', 'working', 'error', 'quota'].includes(status) ? status : 'idle';
+  // quota：模型额度用完 / 限流，until 为预计恢复时间（毫秒时间戳）
+  st.until = status === 'quota' && Number(until) > 0 ? Number(until) : null;
   if (status !== 'working' && st.status === 'working') st.idleSince = Date.now();
   st.status = status;
   st.note = String(note || '').slice(0, 200);
@@ -156,6 +158,7 @@ function presence(projectId) {
       mode: listeners.length ? 'connector' : st?.lastMode === 'wait' ? 'session' : '',
       status: online ? st.status : 'offline',
       note: online ? st.note : '',
+      until: online && st.status === 'quota' ? st.until : null,
       since: st?.since || null,
       host: st?.host || '',
       pending: r.pending.get(a.name)?.size || 0,
@@ -222,6 +225,7 @@ function postMessage(projectId, { from, fromType, text, replyTo, attachments, me
   if (attachments?.length) msg.attachments = attachments;
   if (meta) msg.meta = meta;
   store.addMessage(projectId, msg);
+  const quotaNotes = [];
 
   // 发送者是 agent：更新活跃时间；不支持回执的旧客户端，发言即视为已接单
   if (fromType === 'agent') {
@@ -234,13 +238,28 @@ function postMessage(projectId, { from, fromType, text, replyTo, attachments, me
   }
   for (const name of dispatch) {
     pendingOf(projectId, name).set(msg.id, { ts: msg.ts, from, text: text.slice(0, 60), warned: false });
+    // 派给额度用完的 agent：提醒发消息的人先做别的（同一 agent 10 分钟内只提醒一次）
+    const st = room(projectId).agents.get(name);
+    if (st?.status === 'quota' && st.conns.size && Date.now() - (st.quotaNoticeAt || 0) > 10 * 60_000) {
+      st.quotaNoticeAt = Date.now();
+      quotaNotes.push(`@${name} 的模型额度暂时用完了${st.until ? `，预计${fmtLeft(st.until)}恢复` : ''}。消息已排队，恢复后它会自动处理；在此之前不用等它，可以先推进不依赖它的工作。`);
+    }
   }
   if (dispatch.length) markPendingDirty();
 
   broadcast(projectId, { type: 'message', message: msg });
   if (dispatch.length || fromType === 'agent') broadcastPresence(projectId);
   if (notice) systemMessage(projectId, notice);
+  for (const t of quotaNotes) systemMessage(projectId, t, { kind: 'quota' });
   return msg;
+}
+/** "约 2 小时 5 分钟后" —— 用相对时间，避免服务器和读者时区不同 */
+function fmtLeft(until) {
+  const min = Math.max(1, Math.round((until - Date.now()) / 60_000));
+  if (min < 60) return `约 ${min} 分钟后`;
+  const h = Math.floor(min / 60);
+  if (h < 48) return `约 ${h} 小时${min % 60 ? ` ${min % 60} 分钟` : ''}后`;
+  return `约 ${Math.round(h / 24)} 天后`;
 }
 function findMessage(history, id) {
   for (let i = history.length - 1; i >= 0; i--) if (history[i].id === id) return history[i];
@@ -281,7 +300,7 @@ function checkAcks() {
       for (const [id, e] of pend) {
         if (e.warned) continue;
         if (hasWait) continue; // 等待中的会话马上会拿到
-        if (hasListener && working) continue; // 连接器正忙，排队中
+        if (hasListener && (working || st.status === 'quota')) continue; // 连接器正忙或等额度恢复，排队中
         if (hasListener && !st.ackCapable) continue; // 旧客户端不会回执，在线时无法判断，不误报
         // 连接器空闲：从它空闲时开始计时；会话模式忙碌时放宽到 10 倍
         let start = e.ts;
@@ -651,6 +670,12 @@ function cleanAttachments(projectId, list) {
     }));
 }
 
+/** agent 发言可附带的展示标记（白名单） */
+function agentMeta(meta) {
+  if (!meta || !['quota', 'quota-ok'].includes(meta.kind)) return undefined;
+  return { kind: meta.kind, until: Number(meta.until) > 0 ? Number(meta.until) : undefined };
+}
+
 function onMessage(ws, data, send) {
   const ctx = ws.ctx;
   const st = ctx.kind === 'agent' ? agentState(ctx.projectId, ctx.agent) : null;
@@ -664,7 +689,7 @@ function onMessage(ws, data, send) {
       if (!text && !attachments.length) return send({ type: 'error', error: '消息为空', clientId: data.clientId });
       const msg =
         ctx.kind === 'agent'
-          ? postMessage(ctx.projectId, { from: ctx.agent, fromType: 'agent', text, replyTo: data.replyTo, attachments })
+          ? postMessage(ctx.projectId, { from: ctx.agent, fromType: 'agent', text, replyTo: data.replyTo, attachments, meta: agentMeta(data.meta) })
           : postMessage(ctx.projectId, { from: ctx.name, fromType: 'user', text, attachments });
       if (data.clientId) send({ type: 'sent', clientId: data.clientId, id: msg.id });
       return;
@@ -681,7 +706,7 @@ function onMessage(ws, data, send) {
     }
     case 'status': {
       if (!st) return;
-      setAgentStatus(st, data.status, data.note);
+      setAgentStatus(st, data.status, data.note, data.until);
       broadcastPresence(ctx.projectId);
       if (data.clientId) send({ type: 'acked', clientId: data.clientId });
       return;

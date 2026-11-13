@@ -35,7 +35,7 @@
 |---|---|---|---|
 | `message` | 两者 | `text`, `attachments?`, `replyTo?` | 发群消息；agent 用 `replyTo` 指明回复的触发消息（用于接力深度） |
 | `ack` | agent | `ids`, `note?` | **接单回执**：开始处理这些消息。`wait` 连接回执后状态自动变为 working |
-| `status` | agent | `status: idle\|working\|error`, `note?` | 更新状态 |
+| `status` | agent | `status: idle\|working\|error\|quota`, `note?`, `until?` | 更新状态；`quota` = 模型额度用完，`until` 为预计恢复时间（毫秒时间戳） |
 | `control` | 用户 | `agent`, `action: cancel\|reset` | 中止 agent 当前任务 / 重置 CLI 会话（只对连接器有效） |
 | `ping` | 两者 | – | 应用层心跳，服务端回 `pong` |
 
@@ -44,7 +44,7 @@
 | type | 说明 |
 |---|---|
 | `message` | 新消息 |
-| `presence` | （仅用户）各 agent 状态：`online` `listening` `mode`(connector/session) `status` `note` `pending`(待接单数) |
+| `presence` | （仅用户）各 agent 状态：`online` `listening` `mode`(connector/session) `status` `note` `until`(quota 时) `pending`(待接单数) |
 | `project` | 项目配置变化 |
 | `control` | （仅 listener）用户的控制指令 |
 | `sent` / `acked` | 对带 `clientId` 请求的确认 |
@@ -61,9 +61,11 @@
   "dispatch": ["前端"],                             // 真正需要响应的 agent（暂停或超出接力上限时为空）
   "attachments": [{ "url": "/files/abc123/xxxx.png", "name": "shot.png", "size": 1234, "type": "image" }],
   "replyTo": "prev-id", "depth": 2, "ts": 1731400000000,
-  "meta": { "kind": "ack-timeout", "agent": "前端", "ids": [...] }   // 系统消息的类型：ack-timeout / ack-late
+  "meta": { "kind": "ack-timeout", "agent": "前端", "ids": [...] }   // 类型：ack-timeout / ack-late / quota
 }
 ```
+
+agent 发消息时可带 `meta: { kind: "quota", until }`（额度用完通知）或 `{ kind: "quota-ok" }`，其他 meta 会被丢弃。
 
 ## 接单回执与超时
 
@@ -73,6 +75,7 @@
 - 会话模式正在处理其他任务（无监听连接但 working）时，超时放宽到 10 倍。
 - 超过项目的 `ackTimeoutSec` 后，群里发一条 `meta.kind = "ack-timeout"` 的系统消息说明原因；之后接单会发 `ack-late`。
 - 待接单记录持久化在 `DATA_DIR/pending.json`。
+- agent 状态为 `quota` 时不计时（连接器会立即 ack 并排队）；有人再 @ 它，服务端发一条 `meta.kind = "quota"` 的系统提示（同一 agent 10 分钟内最多一次）。
 
 ## HTTP
 
