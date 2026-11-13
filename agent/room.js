@@ -61,11 +61,38 @@ const commands = {
   async wait() {
     need();
     const timeoutSec = parseFloat(args.timeout ?? '600');
+    const deadline = timeoutSec > 0 ? Date.now() + timeoutSec * 1000 : Infinity;
+    const timeoutExit = () => {
+      out(`（${timeoutSec} 秒内没有 @你 的新消息。请再次运行 room wait 继续等待。）`);
+      process.exit(3);
+    };
+    // 服务端重启 / 网络抖动时自动重连，直到等到消息或超时
+    let backoff = 1000;
+    for (;;) {
+      let r;
+      try {
+        r = await waitOnce(deadline); // 定义在文件末尾
+      } catch (e) {
+        if (/code=40(03|04|09)|token|不存在|不正确/.test(e.message)) throw e; // 鉴权失败 / 被新连接替换：不重连
+        r = 'closed';
+      }
+      if (r === 'done') return;
+      if (r === 'timeout' || Date.now() + backoff >= deadline) return timeoutExit();
+      if (r === 'replaced') return out('（本次 room wait 被同一 agent 的新连接替换，已退出。）');
+      process.stderr.write(`（与服务器的连接断开，${backoff / 1000} 秒后重连…）\n`);
+      await new Promise((res) => setTimeout(res, backoff));
+      backoff = Math.min(backoff * 2, 10_000);
+    }
+  },
+
+  async _waitOnceBody(deadline) {
     const st = readState(conn);
     const seenTs = st.seenTs || 0;
     const buffer = [];
     let resolveHit;
     const hit = new Promise((r) => (resolveHit = r));
+    let resolveClosed;
+    const closed = new Promise((r) => (resolveClosed = r));
     const c = await connectAgent(conn, {
       mode: 'wait',
       historyLimit: 200,
@@ -74,6 +101,7 @@ const commands = {
         buffer.push(d.message);
         if (isForMe(d.message)) resolveHit();
       },
+      onClose: (ev) => resolveClosed(ev.code === 4009 ? 'replaced' : 'closed'),
     });
     const pendingIds = new Set(c.welcome.pending || []);
     const hist = c.welcome.history;
@@ -84,15 +112,15 @@ const commands = {
     if (!ready()) {
       let timer;
       const timedOut = new Promise((r) => {
-        if (timeoutSec > 0) timer = setTimeout(() => r('timeout'), timeoutSec * 1000);
+        if (deadline !== Infinity) timer = setTimeout(() => r('timeout'), Math.max(0, deadline - Date.now()));
       });
-      const r = await Promise.race([hit, timedOut]);
+      const r = await Promise.race([hit, timedOut, closed]);
       clearTimeout(timer);
       if (r === 'timeout') {
         c.close();
-        out(`（${timeoutSec} 秒内没有 @你 的新消息。请再次运行 room wait 继续等待。）`);
-        process.exit(3);
+        return 'timeout';
       }
+      if (r === 'closed' || r === 'replaced') return r;
     }
     const all = [...fresh, ...buffer].filter((m, i, a) => a.findIndex((x) => x.id === m.id) === i);
     const mine = all.filter((m) => isForMe(m) || pendingIds.has(m.id));
@@ -103,6 +131,7 @@ const commands = {
     await c.request({ type: 'ack', ids: mine.map((m) => m.id), note: `处理 ${mine[mine.length - 1].from} 的消息` }).catch(() => {});
     updateState(conn, { seenTs: Math.max(seenTs, ...all.map((m) => m.ts)), lastTrigger: mine[mine.length - 1].id });
     c.close();
+    return 'done';
   },
 
   async inbox() {
@@ -201,6 +230,7 @@ const commands = {
   },
 };
 
-const fn = commands[cmd];
+const waitOnce = (deadline) => commands._waitOnceBody(deadline);
+const fn = cmd.startsWith('_') ? null : commands[cmd];
 if (!fn) die(`未知命令：${cmd}\n运行 room help 查看用法`);
 fn().catch((e) => die('错误：' + e.message));

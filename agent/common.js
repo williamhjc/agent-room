@@ -139,7 +139,7 @@ export function fmtMessage(m, { base = '', maxLen = 3000, me = '' } = {}) {
  * 连接并完成 hello，返回 { welcome, send, request, onMessage, close }
  * request(data) 会附带 clientId，等待服务端回执（sent/acked/error）
  */
-export function connectAgent(conn, { mode = 'tool', historyLimit = 100, onMessage, timeoutMs = 15000 } = {}) {
+export function connectAgent(conn, { mode = 'tool', historyLimit = 100, onMessage, onClose, timeoutMs = 15000 } = {}) {
   return new Promise((resolve, reject) => {
     const ws = new WS(conn.server);
     const waiters = new Map();
@@ -201,6 +201,7 @@ export function connectAgent(conn, { mode = 'tool', historyLimit = 100, onMessag
       if (!welcomed) reject(new Error(`连接被关闭 code=${ev.code} ${ev.reason || ''}`));
       for (const w of waiters.values()) w.rej(new Error('连接已关闭'));
       waiters.clear();
+      if (welcomed) onClose?.(ev);
     };
   });
 }
