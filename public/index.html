@@ -8,6 +8,18 @@
   <link rel="stylesheet" href="/style.css" />
 </head>
 <body>
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true">
+    <symbol id="ico-claude" viewBox="-50 -50 100 100">
+      <circle r="50" fill="#f6e9dc"/>
+      <g fill="#d97757" stroke="#d97757" stroke-width="2" stroke-linejoin="round"><path d="M-3.4 -5 L0 -38 L3.4 -5 Z" transform="rotate(0)"/><path d="M-3.4 -5 L0 -32 L3.4 -5 Z" transform="rotate(30)"/><path d="M-3.4 -5 L0 -40 L3.4 -5 Z" transform="rotate(60)"/><path d="M-3.4 -5 L0 -34 L3.4 -5 Z" transform="rotate(90)"/><path d="M-3.4 -5 L0 -37 L3.4 -5 Z" transform="rotate(120)"/><path d="M-3.4 -5 L0 -31 L3.4 -5 Z" transform="rotate(150)"/><path d="M-3.4 -5 L0 -39 L3.4 -5 Z" transform="rotate(180)"/><path d="M-3.4 -5 L0 -33 L3.4 -5 Z" transform="rotate(210)"/><path d="M-3.4 -5 L0 -38 L3.4 -5 Z" transform="rotate(240)"/><path d="M-3.4 -5 L0 -32 L3.4 -5 Z" transform="rotate(270)"/><path d="M-3.4 -5 L0 -36 L3.4 -5 Z" transform="rotate(300)"/><path d="M-3.4 -5 L0 -34 L3.4 -5 Z" transform="rotate(330)"/></g>
+      <circle r="6.5" fill="#d97757"/>
+    </symbol>
+    <symbol id="ico-codex" viewBox="-50 -50 100 100">
+      <circle r="50" fill="#0f1115"/>
+      <circle r="46.5" fill="none" stroke="#10a37f" stroke-width="3"/>
+      <g fill="none" stroke="#ffffff" stroke-width="5.2" stroke-linejoin="round"><rect x="-8.5" y="-31" width="17" height="35" rx="8.5" transform="rotate(0)"/><rect x="-8.5" y="-31" width="17" height="35" rx="8.5" transform="rotate(60)"/><rect x="-8.5" y="-31" width="17" height="35" rx="8.5" transform="rotate(120)"/><rect x="-8.5" y="-31" width="17" height="35" rx="8.5" transform="rotate(180)"/><rect x="-8.5" y="-31" width="17" height="35" rx="8.5" transform="rotate(240)"/><rect x="-8.5" y="-31" width="17" height="35" rx="8.5" transform="rotate(300)"/></g>
+    </symbol>
+  </svg>
   <div id="app" class="layout">
     <!-- 左侧：项目列表 -->
     <aside class="sidebar" id="sidebar">
@@ -27,7 +39,10 @@
     <!-- 中间：聊天 -->
     <main class="chat" id="chat">
       <div class="empty-state" id="emptyState">
-        <div class="empty-icon">@</div>
+        <div class="empty-hero">
+          <div class="avatar claude"><svg class="head-ico" viewBox="0 0 100 100"><use href="#ico-claude" width="100" height="100"/></svg></div>
+          <div class="avatar codex"><svg class="head-ico" viewBox="0 0 100 100"><use href="#ico-codex" width="100" height="100"/></svg></div>
+        </div>
         <h2>多 Agent 协作聊天室</h2>
         <p>创建项目、定义 agent 分工，然后在各自机器上运行连接器让 Claude Code / Codex 加入房间。<br />在群里 @ 某个 agent 给它派活，agent 之间也通过 @ 互相协作。</p>
         <button class="btn primary" id="btnNew2">＋ 新建第一个项目</button>
@@ -46,8 +61,11 @@
       <div class="working-bar hidden" id="workingBar"></div>
       <footer class="composer hidden" id="composer">
         <div class="chips" id="mentionChips"></div>
+        <div class="attach-list hidden" id="attachList"></div>
         <div class="composer-row">
           <div class="mention-pop hidden" id="mentionPop"></div>
+          <button class="icon-btn attach-btn" id="btnAttach" title="添加图片/文件（也可直接粘贴或拖拽）">📎</button>
+          <input type="file" id="fileInput" multiple hidden />
           <textarea id="input" rows="1" placeholder="输入消息，@成员 派发任务（Enter 发送，Shift+Enter 换行）"></textarea>
           <button class="btn primary" id="btnSend">发送</button>
         </div>
@@ -57,7 +75,7 @@
     <!-- 右侧：成员 -->
     <aside class="members hidden" id="members">
       <div class="members-head">
-        <h3>成员与分工</h3>
+        <h3><span class="glow-dot"></span>Agent 工位</h3>
         <button class="icon-btn mobile-only" id="btnCloseMembers">✕</button>
       </div>
       <div id="memberList"></div>
@@ -76,6 +94,7 @@
         <label>项目名称<input class="input" name="name" required maxlength="80" placeholder="例如：电商后台重构" /></label>
         <label>Agent 自动接力上限<input class="input" name="maxHops" type="number" min="1" max="100" value="12" /></label>
       </div>
+      <label>派活后多少秒无人接单就在群里提醒（5-3600）<input class="input" name="ackTimeoutSec" type="number" min="5" max="3600" value="60" /></label>
       <label>项目说明 / 目标<textarea class="input" name="description" rows="3" placeholder="项目背景、目标、技术栈、约束……所有 agent 都会看到"></textarea></label>
       <label>默认工作目录（连接器命令中的 --workdir，可在各机器上自行修改）<input class="input" name="workdir" placeholder="例如：D:\code\shop 或 /srv/shop" /></label>
       <div class="roles-head">
@@ -100,15 +119,26 @@
   <!-- 连接命令 -->
   <dialog id="connectDialog" class="dialog">
     <h2 id="connTitle">连接 agent</h2>
-    <p class="muted">在 agent 所在机器上（需已安装并登录 <code id="connCli"></code> CLI，Node ≥ 18），克隆本仓库后执行：</p>
+    <div class="tabs" id="connModes">
+      <button class="tab active" data-mode="connector">连接器模式（推荐）</button>
+      <button class="tab" data-mode="session">交互会话模式</button>
+    </div>
+    <p class="muted small" id="connDesc"></p>
     <div class="tabs" id="connTabs">
       <button class="tab active" data-os="unix">macOS / Linux</button>
       <button class="tab" data-os="ps">Windows PowerShell</button>
     </div>
+    <div class="step-title">① 下载 agent 工具（需 Node ≥ 22，不用克隆仓库）</div>
+    <pre class="cmd" id="connDl"></pre>
+    <div class="step-title" id="connStep2"></div>
     <pre class="cmd" id="connCmd"></pre>
-    <p class="muted small">可选参数：<code>--yolo</code> 跳过所有权限确认（全自动）、<code>--model</code> 指定模型、<code>--permission</code> 权限模式、<code>--timeout</code> 单次任务超时（分钟）、<code>--dry-run</code> 不调用 CLI 只回显（联调用）。</p>
+    <div id="connPromptWrap" class="hidden">
+      <div class="step-title">③ 把下面这段发给该 agent 的交互会话（Codex / Claude Code），它会进入"等消息 → 干活 → 回复 → 再等"的循环</div>
+      <pre class="cmd" id="connPrompt"></pre>
+    </div>
+    <p class="muted small" id="connOpts"></p>
     <div class="dlg-actions">
-      <button class="btn" id="btnCopy">复制命令</button>
+      <button class="btn" id="btnCopy">复制全部</button>
       <button class="btn primary" id="btnConnClose">关闭</button>
     </div>
   </dialog>

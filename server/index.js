@@ -9,12 +9,18 @@ import { WebSocketServer } from 'ws';
 import { Store, newId, parseMentions } from './store.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const ROOT = path.join(__dirname, '..');
 const PORT = parseInt(process.env.PORT || '8787', 10);
 const HOST = process.env.HOST || '0.0.0.0';
-const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(__dirname, '..', 'data'));
+const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(ROOT, 'data'));
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || ''; // 为空则网页端无需登录（仅建议本地使用）
-const PUBLIC_DIR = path.join(__dirname, '..', 'public');
+// 网页用户的 WS 连接必须带浏览器 Origin，防止脚本/agent 拿到令牌后冒充用户发言。设为 0 关闭。
+const REQUIRE_ORIGIN = process.env.REQUIRE_ORIGIN !== '0';
+const ACK_CHECK_MS = parseInt(process.env.ACK_CHECK_MS || '5000', 10);
+const PUBLIC_DIR = path.join(ROOT, 'public');
 const MAX_TEXT = 100_000;
+const MAX_UPLOAD = 20 * 1024 * 1024;
+const SESSION_WORKING_TTL = 3600_000; // 会话模式下"工作中"状态的最长保留时间
 
 const store = new Store(DATA_DIR);
 
@@ -36,48 +42,123 @@ function sendJson(res, code, data) {
   res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
   res.end(body);
 }
-function readBody(req) {
+function readRaw(req, limit) {
   return new Promise((resolve, reject) => {
     let size = 0;
     const chunks = [];
     req.on('data', (c) => {
       size += c.length;
-      if (size > 1_000_000) {
-        reject(new Error('请求体过大'));
+      if (size > limit) {
+        reject(new Error(`请求体过大（上限 ${Math.round(limit / 1024 / 1024)}MB）`));
         req.destroy();
       } else chunks.push(c);
     });
-    req.on('end', () => {
-      try {
-        resolve(chunks.length ? JSON.parse(Buffer.concat(chunks).toString('utf8')) : {});
-      } catch {
-        reject(new Error('JSON 解析失败'));
-      }
-    });
+    req.on('end', () => resolve(Buffer.concat(chunks)));
     req.on('error', reject);
   });
 }
+async function readBody(req) {
+  const buf = await readRaw(req, 1_000_000);
+  try {
+    return buf.length ? JSON.parse(buf.toString('utf8')) : {};
+  } catch {
+    throw new Error('JSON 解析失败');
+  }
+}
 
-// ---------- 房间（在线状态） ----------
-/** projectId -> { users:Set<ws>, agents:Map<name,{ws,status,note,since}> } */
+// ---------- 房间（在线状态 / 派活回执） ----------
+/**
+ * projectId -> {
+ *   users: Set<ws>,
+ *   agents: Map<name, AgentState>,
+ *   pending: Map<name, Map<msgId, {ts, from, text, warned}>>   // 已派发但未确认接单
+ * }
+ * AgentState = { conns:Set<ws>, status, note, since, host, lastActivity, idleSince, ackCapable }
+ * 连接 mode：listener（connector/桥接，常驻） | wait（room wait，等待消息） | tool（一次性命令）
+ */
 const rooms = new Map();
 function room(id) {
-  if (!rooms.has(id)) rooms.set(id, { users: new Set(), agents: new Map() });
+  if (!rooms.has(id)) rooms.set(id, { users: new Set(), agents: new Map(), pending: new Map() });
   return rooms.get(id);
 }
+function agentState(projectId, name) {
+  const r = room(projectId);
+  if (!r.agents.has(name)) {
+    r.agents.set(name, { conns: new Set(), status: 'idle', note: '', since: null, host: '', lastActivity: 0, idleSince: Date.now(), ackCapable: false });
+  }
+  return r.agents.get(name);
+}
+function connsOf(st, ...modes) {
+  return [...st.conns].filter((ws) => modes.includes(ws.ctx.mode));
+}
+function setAgentStatus(st, status, note = '') {
+  status = ['idle', 'working', 'error'].includes(status) ? status : 'idle';
+  if (status !== 'working' && st.status === 'working') st.idleSince = Date.now();
+  st.status = status;
+  st.note = String(note || '').slice(0, 200);
+  st.statusAt = Date.now();
+}
+function pendingOf(projectId, name) {
+  const r = room(projectId);
+  if (!r.pending.has(name)) r.pending.set(name, new Map());
+  return r.pending.get(name);
+}
+
+// 待接单记录持久化到 DATA_DIR/pending.json，服务重启后仍能提醒 / 补派
+const PENDING_FILE = path.join(DATA_DIR, 'pending.json');
+let pendingSaveTimer = null;
+function markPendingDirty() {
+  if (pendingSaveTimer) return;
+  pendingSaveTimer = setTimeout(() => {
+    pendingSaveTimer = null;
+    const out = {};
+    for (const [pid, r] of rooms) {
+      for (const [name, m] of r.pending) {
+        if (!m.size) continue;
+        (out[pid] ||= {})[name] = Object.fromEntries(m);
+      }
+    }
+    try {
+      fs.writeFileSync(PENDING_FILE + '.tmp', JSON.stringify(out));
+      fs.renameSync(PENDING_FILE + '.tmp', PENDING_FILE);
+    } catch (e) {
+      console.error('[agent-room] 保存 pending 失败', e.message);
+    }
+  }, 300);
+}
+try {
+  const saved = JSON.parse(fs.readFileSync(PENDING_FILE, 'utf8'));
+  for (const [pid, agents] of Object.entries(saved)) {
+    if (!store.getProject(pid)) continue;
+    for (const [name, entries] of Object.entries(agents)) {
+      // 重启后重新计时，避免一启动就批量报超时
+      const m = pendingOf(pid, name);
+      for (const [id, e] of Object.entries(entries)) m.set(id, { ...e, ts: Math.max(e.ts, Date.now() - 1000) , origTs: e.origTs || e.ts });
+    }
+  }
+} catch {}
 function presence(projectId) {
   const p = store.getProject(projectId);
   const r = room(projectId);
   return (p?.agents || []).map((a) => {
-    const c = r.agents.get(a.name);
+    const st = r.agents.get(a.name);
+    const listeners = st ? connsOf(st, 'listener') : [];
+    const waits = st ? connsOf(st, 'wait') : [];
+    const listening = listeners.length > 0 || waits.length > 0;
+    // 会话模式（room wait）在处理任务时没有常驻连接，但仍算"工作中"
+    const sessionWorking = st && st.status === 'working' && Date.now() - (st.statusAt || 0) < SESSION_WORKING_TTL;
+    const online = listening || !!sessionWorking;
     return {
       name: a.name,
       type: a.type,
-      online: !!c,
-      status: c ? c.status : 'offline',
-      note: c?.note || '',
-      since: c?.since || null,
-      host: c?.host || '',
+      online,
+      listening,
+      mode: listeners.length ? 'connector' : st?.lastMode === 'wait' ? 'session' : '',
+      status: online ? st.status : 'offline',
+      note: online ? st.note : '',
+      since: st?.since || null,
+      host: st?.host || '',
+      pending: r.pending.get(a.name)?.size || 0,
     };
   });
 }
@@ -86,14 +167,27 @@ function broadcast(projectId, data, { usersOnly = false } = {}) {
   if (!r) return;
   const raw = JSON.stringify(data);
   for (const ws of r.users) if (ws.readyState === 1) ws.send(raw);
-  if (!usersOnly) for (const { ws } of r.agents.values()) if (ws.readyState === 1) ws.send(raw);
+  if (!usersOnly) for (const st of r.agents.values()) for (const ws of st.conns) if (ws.readyState === 1) ws.send(raw);
 }
+let presenceTimer = new Map();
 function broadcastPresence(projectId) {
-  broadcast(projectId, { type: 'presence', agents: presence(projectId) }, { usersOnly: true });
+  // 合并短时间内的多次更新
+  if (presenceTimer.has(projectId)) return;
+  presenceTimer.set(
+    projectId,
+    setTimeout(() => {
+      presenceTimer.delete(projectId);
+      broadcast(projectId, { type: 'presence', agents: presence(projectId) }, { usersOnly: true });
+    }, 50)
+  );
+}
+
+function systemMessage(projectId, text, meta) {
+  return postMessage(projectId, { from: 'system', fromType: 'system', text, meta });
 }
 
 /** 写入并广播一条消息，计算 @提及与派发对象 */
-function postMessage(projectId, { from, fromType, text, replyTo }) {
+function postMessage(projectId, { from, fromType, text, replyTo, attachments, meta }) {
   const p = store.getProject(projectId);
   if (!p) throw new Error('项目不存在');
   text = String(text || '').slice(0, MAX_TEXT);
@@ -125,15 +219,94 @@ function postMessage(projectId, { from, fromType, text, replyTo }) {
     depth,
     ts: Date.now(),
   };
+  if (attachments?.length) msg.attachments = attachments;
+  if (meta) msg.meta = meta;
   store.addMessage(projectId, msg);
+
+  // 发送者是 agent：更新活跃时间；不支持回执的旧客户端，发言即视为已接单
+  if (fromType === 'agent') {
+    const st = agentState(projectId, from);
+    st.lastActivity = Date.now();
+    if (!st.ackCapable && pendingOf(projectId, from).size) {
+      pendingOf(projectId, from).clear();
+      markPendingDirty();
+    }
+  }
+  for (const name of dispatch) {
+    pendingOf(projectId, name).set(msg.id, { ts: msg.ts, from, text: text.slice(0, 60), warned: false });
+  }
+  if (dispatch.length) markPendingDirty();
+
   broadcast(projectId, { type: 'message', message: msg });
-  if (notice) postMessage(projectId, { from: 'system', fromType: 'system', text: notice });
+  if (dispatch.length || fromType === 'agent') broadcastPresence(projectId);
+  if (notice) systemMessage(projectId, notice);
   return msg;
 }
 function findMessage(history, id) {
   for (let i = history.length - 1; i >= 0; i--) if (history[i].id === id) return history[i];
   return null;
 }
+
+function ackMessages(projectId, agent, ids) {
+  const pend = pendingOf(projectId, agent);
+  const warnedOnes = [];
+  for (const id of ids) {
+    const e = pend.get(id);
+    if (!e) continue;
+    if (e.warned) warnedOnes.push(e);
+    pend.delete(id);
+  }
+  markPendingDirty();
+  if (warnedOnes.length) systemMessage(projectId, `@${agent} 已接单（此前超时未响应的 ${warnedOnes.length} 条消息）。`, { kind: 'ack-late', agent });
+  broadcastPresence(projectId);
+}
+
+/** 定期检查：派发后长时间无人接单就在群里提示，让用户知道 agent "停了" */
+function checkAcks() {
+  const now = Date.now();
+  for (const [projectId, r] of rooms) {
+    const p = store.getProject(projectId);
+    if (!p) continue;
+    const T = (p.ackTimeoutSec || 60) * 1000;
+    for (const [name, pend] of r.pending) {
+      if (!p.agents.find((a) => a.name === name)) {
+        r.pending.delete(name);
+        continue;
+      }
+      const st = r.agents.get(name);
+      const hasListener = st && connsOf(st, 'listener').length > 0;
+      const hasWait = st && connsOf(st, 'wait').length > 0;
+      const working = st?.status === 'working';
+      const due = [];
+      for (const [id, e] of pend) {
+        if (e.warned) continue;
+        if (hasWait) continue; // 等待中的会话马上会拿到
+        if (hasListener && working) continue; // 连接器正忙，排队中
+        if (hasListener && !st.ackCapable) continue; // 旧客户端不会回执，在线时无法判断，不误报
+        // 连接器空闲：从它空闲时开始计时；会话模式忙碌时放宽到 10 倍
+        let start = e.ts;
+        if (hasListener) start = Math.max(e.ts, st.idleSince || 0);
+        const limit = !hasListener && working ? T * 10 : T;
+        if (now - start >= limit) due.push([id, e]);
+      }
+      if (!due.length) continue;
+      for (const [, e] of due) e.warned = true;
+      markPendingDirty();
+      let reason;
+      if (hasListener) reason = '连接器在线但没有开始处理，可能卡住了，可以在成员面板「中止」后重试';
+      else if (working) reason = '它还在处理之前的任务，且没有在监听新消息（会话模式需在完成后运行 room wait）';
+      else if (st && st.lastMode === 'wait') reason = '它的会话没有在监听（完成上一轮后没有再运行 room wait），需要唤醒它';
+      else reason = '它当前离线，请启动它的连接器';
+      const secs = Math.round((now - (due[0][1].origTs || due[0][1].ts)) / 1000);
+      systemMessage(
+        projectId,
+        `⚠️ @${name} 有 ${due.length} 条派发 ${secs} 秒未接单：${reason}。消息已保留，它上线 / 监听后会收到。`,
+        { kind: 'ack-timeout', agent: name, ids: due.map(([id]) => id) }
+      );
+    }
+  }
+}
+setInterval(checkAcks, ACK_CHECK_MS).unref();
 
 // ---------- HTTP ----------
 const MIME = {
@@ -142,17 +315,48 @@ const MIME = {
   '.css': 'text/css; charset=utf-8',
   '.svg': 'image/svg+xml',
   '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
   '.ico': 'image/x-icon',
   '.json': 'application/json',
+  '.txt': 'text/plain; charset=utf-8',
+  '.md': 'text/plain; charset=utf-8',
+  '.log': 'text/plain; charset=utf-8',
+  '.pdf': 'application/pdf',
+  '.zip': 'application/zip',
 };
+const INLINE_TYPES = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.txt', '.md', '.log', '.json', '.pdf']);
+const EXT_BY_TYPE = { 'image/png': '.png', 'image/jpeg': '.jpg', 'image/gif': '.gif', 'image/webp': '.webp', 'text/plain': '.txt', 'application/pdf': '.pdf', 'application/zip': '.zip', 'application/json': '.json' };
+
+function serveFile(res, file, { download = false, name } = {}) {
+  fs.stat(file, (err, st) => {
+    if (err || !st.isFile()) return sendJson(res, 404, { error: 'not found' });
+    const ext = path.extname(file).toLowerCase();
+    const headers = {
+      'Content-Type': (download ? null : MIME[ext]) || 'application/octet-stream',
+      'Content-Length': st.size,
+      'X-Content-Type-Options': 'nosniff',
+    };
+    if (download) {
+      headers['Content-Disposition'] = `attachment; filename*=UTF-8''${encodeURIComponent(name || path.basename(file))}`;
+      headers['Cache-Control'] = 'private, max-age=86400';
+    }
+    res.writeHead(200, headers);
+    fs.createReadStream(file).pipe(res);
+  });
+}
 
 function serveStatic(req, res, pathname) {
   if (pathname === '/') pathname = '/index.html';
+  // 方便远程机器直接下载连接器和 room 工具，无需克隆仓库
+  const am = pathname.match(/^\/agent\/(connector|room|common)\.js$/);
+  if (am) return serveFile(res, path.join(ROOT, 'agent', `${am[1]}.js`));
   const file = path.normalize(path.join(PUBLIC_DIR, pathname));
   if (!file.startsWith(PUBLIC_DIR)) return sendJson(res, 403, { error: 'forbidden' });
   fs.readFile(file, (err, buf) => {
     if (err) {
-      // SPA：未知路径回退到 index.html
       return fs.readFile(path.join(PUBLIC_DIR, 'index.html'), (e2, b2) => {
         if (e2) return sendJson(res, 404, { error: 'not found' });
         res.writeHead(200, { 'Content-Type': MIME['.html'] });
@@ -164,41 +368,77 @@ function serveStatic(req, res, pathname) {
   });
 }
 
+/** 上传的附件：/files/<projectId>/<fileId><ext>，文件名不可猜测，图片等安全类型内联显示，其余一律下载 */
+function serveUpload(req, res, url) {
+  const m = url.pathname.match(/^\/files\/([\w-]+)\/([\w-]+)(\.[a-z0-9]{1,8})?$/);
+  if (!m) return sendJson(res, 404, { error: 'not found' });
+  const file = path.join(store.uploadDir(m[1]), m[2] + (m[3] || ''));
+  const ext = (m[3] || '').toLowerCase();
+  serveFile(res, file, { download: !INLINE_TYPES.has(ext) || url.searchParams.has('download'), name: url.searchParams.get('name') || undefined });
+}
+
+/** 鉴权：管理员令牌 或 某个 agent 的 token（Authorization: Agent <token>） */
+function authOf(req, project) {
+  const h = req.headers.authorization || '';
+  const m = h.match(/^(Bearer|Agent)\s+(.+)$/i);
+  const kind = m?.[1].toLowerCase();
+  const tok = m?.[2].trim() || '';
+  if (kind === 'agent' && project) {
+    const a = project.agents.find((x) => safeEqual(x.token, tok));
+    return a ? { agent: a.name } : null;
+  }
+  return isAdmin(tok) ? { admin: true } : null;
+}
+
 async function handleApi(req, res, url) {
   const parts = url.pathname.split('/').filter(Boolean); // ['api', ...]
   if (parts[1] === 'config' && req.method === 'GET') {
-    return sendJson(res, 200, { authRequired: !!ADMIN_TOKEN });
+    return sendJson(res, 200, { authRequired: !!ADMIN_TOKEN, publicUrl: process.env.PUBLIC_URL || '' });
   }
-  const auth = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
-  if (!isAdmin(auth)) return sendJson(res, 401, { error: '未授权：请输入正确的访问令牌' });
-
   if (parts[1] !== 'projects') return sendJson(res, 404, { error: 'not found' });
   const id = parts[2];
+  const p = id ? store.getProject(id) : null;
+  const auth = authOf(req, p);
+  if (!auth) return sendJson(res, 401, { error: '未授权：请输入正确的访问令牌' });
+  if (id && !p) return sendJson(res, 404, { error: '项目不存在' });
+
+  // 上传附件：管理员和该项目的 agent 都可以
+  if (parts[3] === 'uploads' && req.method === 'POST') {
+    const buf = await readRaw(req, MAX_UPLOAD);
+    if (!buf.length) return sendJson(res, 400, { error: '空文件' });
+    const name = String(url.searchParams.get('name') || 'file').replace(/[\\/\0\r\n]/g, '_').slice(0, 120);
+    let ext = path.extname(name).toLowerCase().replace(/[^.a-z0-9]/g, '').slice(0, 9);
+    const type = String(req.headers['content-type'] || '').split(';')[0].trim();
+    if (!ext) ext = EXT_BY_TYPE[type] || '';
+    const fid = newId(20);
+    fs.mkdirSync(store.uploadDir(id), { recursive: true });
+    fs.writeFileSync(path.join(store.uploadDir(id), fid + ext), buf);
+    const isImage = ['.png', '.jpg', '.jpeg', '.gif', '.webp'].includes(ext);
+    return sendJson(res, 201, {
+      attachment: { url: `/files/${id}/${fid}${ext}`, name, size: buf.length, type: isImage ? 'image' : 'file' },
+    });
+  }
+
+  // 以下仅管理员
+  if (!auth.admin) return sendJson(res, 403, { error: '该操作需要管理员令牌' });
 
   if (!id) {
     if (req.method === 'GET') {
       return sendJson(res, 200, {
-        projects: store.listProjects().map((p) => ({
-          ...publicProject(p),
-          online: presence(p.id).filter((a) => a.online).length,
-          messageCount: store.getMessages(p.id).length,
+        projects: store.listProjects().map((x) => ({
+          ...publicProject(x),
+          online: presence(x.id).filter((a) => a.online).length,
+          messageCount: store.getMessages(x.id).length,
         })),
       });
     }
     if (req.method === 'POST') {
       const body = await readBody(req);
-      const p = store.createProject(body);
-      postMessage(p.id, {
-        from: 'system',
-        fromType: 'system',
-        text: `项目「${p.name}」已创建，成员：${p.agents.map((a) => `@${a.name}（${a.type}）`).join('、')}`,
-      });
-      return sendJson(res, 201, { project: p });
+      const np = store.createProject(body);
+      systemMessage(np.id, `项目「${np.name}」已创建，成员：${np.agents.map((a) => `@${a.name}（${a.type}）`).join('、')}`);
+      return sendJson(res, 201, { project: np });
     }
   }
-
-  const p = store.getProject(id);
-  if (!p) return sendJson(res, 404, { error: '项目不存在' });
 
   if (parts.length === 3) {
     if (req.method === 'GET') return sendJson(res, 200, { project: p, presence: presence(id) });
@@ -207,28 +447,30 @@ async function handleApi(req, res, url) {
       const before = new Set(p.agents.map((a) => a.name));
       const wasPaused = p.paused;
       const updated = store.updateProject(id, body);
-      // 被删除的 agent 断开连接
       const r = room(id);
-      for (const [name, c] of r.agents) {
-        if (!updated.agents.find((a) => a.name === name)) c.ws.close(4003, 'agent removed');
+      for (const [name, st] of r.agents) {
+        if (!updated.agents.find((a) => a.name === name)) {
+          for (const ws of st.conns) ws.close(4003, 'agent removed');
+          r.agents.delete(name);
+          r.pending.delete(name);
+        }
       }
       broadcast(id, { type: 'project', project: publicProject(updated) });
       broadcastPresence(id);
       if (body.paused !== undefined && wasPaused !== updated.paused) {
-        postMessage(id, { from: 'system', fromType: 'system', text: updated.paused ? '项目已暂停。' : '项目已恢复。' });
+        systemMessage(id, updated.paused ? '项目已暂停。' : '项目已恢复。');
       }
       const added = updated.agents.filter((a) => !before.has(a.name));
-      if (added.length) {
-        postMessage(id, { from: 'system', fromType: 'system', text: `新成员加入分工：${added.map((a) => '@' + a.name).join('、')}` });
-      }
+      if (added.length) systemMessage(id, `新成员加入分工：${added.map((a) => '@' + a.name).join('、')}`);
       return sendJson(res, 200, { project: updated });
     }
     if (req.method === 'DELETE') {
       const r = room(id);
-      for (const c of r.agents.values()) c.ws.close(4004, 'project deleted');
+      for (const st of r.agents.values()) for (const ws of st.conns) ws.close(4004, 'project deleted');
       for (const ws of r.users) ws.close(4004, 'project deleted');
       rooms.delete(id);
       store.deleteProject(id);
+      markPendingDirty();
       return sendJson(res, 200, { ok: true });
     }
   }
@@ -254,9 +496,10 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/healthz') return sendJson(res, 200, { ok: true });
     if (url.pathname.startsWith('/api/')) return await handleApi(req, res, url);
     if (req.method !== 'GET') return sendJson(res, 405, { error: 'method not allowed' });
+    if (url.pathname.startsWith('/files/')) return serveUpload(req, res, url);
     serveStatic(req, res, decodeURIComponent(url.pathname));
   } catch (e) {
-    sendJson(res, 400, { error: e.message || String(e) });
+    if (!res.headersSent) sendJson(res, 400, { error: e.message || String(e) });
   }
 });
 
@@ -282,7 +525,7 @@ wss.on('connection', (ws, req) => {
       if (!ws.ctx) return onHello(ws, data, send, req);
       onMessage(ws, data, send);
     } catch (e) {
-      send({ type: 'error', error: e.message || String(e) });
+      send({ type: 'error', error: e.message || String(e), clientId: data.clientId });
     }
   });
 
@@ -291,13 +534,28 @@ wss.on('connection', (ws, req) => {
     const ctx = ws.ctx;
     if (!ctx) return;
     const r = room(ctx.projectId);
-    if (ctx.kind === 'user') r.users.delete(ws);
-    else if (r.agents.get(ctx.agent)?.ws === ws) {
-      r.agents.delete(ctx.agent);
-      broadcastPresence(ctx.projectId);
-    }
+    if (ctx.kind === 'user') return r.users.delete(ws);
+    const st = r.agents.get(ctx.agent);
+    if (!st) return;
+    st.conns.delete(ws);
+    if (ctx.mode === 'listener' && !connsOf(st, 'listener').length && st.status === 'working') setAgentStatus(st, 'idle');
+    if (ctx.mode !== 'tool') broadcastPresence(ctx.projectId);
   });
 });
+
+function sameOrigin(req) {
+  const origin = req.headers.origin;
+  if (!origin) return false;
+  const allowed = (process.env.ALLOWED_ORIGINS || '').split(',').map((s) => s.trim()).filter(Boolean);
+  if (allowed.includes(origin)) return true;
+  try {
+    const u = new URL(origin);
+    const host = req.headers['x-forwarded-host'] || req.headers.host;
+    return u.host === host;
+  } catch {
+    return false;
+  }
+}
 
 function onHello(ws, data, send, req) {
   if (data.type !== 'hello') throw new Error('请先发送 hello');
@@ -313,30 +571,42 @@ function onHello(ws, data, send, req) {
       send({ type: 'error', error: 'agent 名称或 token 不正确', fatal: true });
       return ws.close(4003, 'bad agent credentials');
     }
-    const old = r.agents.get(def.name);
-    if (old && old.ws !== ws) {
-      try {
-        old.ws.send(JSON.stringify({ type: 'error', error: '同名 agent 在别处登录，本连接被替换', fatal: true }));
-      } catch {}
-      old.ws.close(4009, 'replaced');
+    const mode = ['listener', 'wait', 'tool'].includes(data.mode) ? data.mode : 'listener';
+    const st = agentState(p.id, def.name);
+    // 同名常驻连接只保留一个（避免两个连接器重复干活）；等待连接也只保留最新的
+    if (mode !== 'tool') {
+      for (const old of connsOf(st, mode)) {
+        try {
+          old.send(JSON.stringify({ type: 'error', error: `同名 agent 的另一个 ${mode} 连接上线，本连接被替换`, fatal: true }));
+        } catch {}
+        old.close(4009, 'replaced');
+        st.conns.delete(old);
+      }
     }
-    ws.ctx = { kind: 'agent', projectId: p.id, agent: def.name };
-    r.agents.set(def.name, {
-      ws,
-      status: 'idle',
-      note: '',
-      since: Date.now(),
-      host: String(data.host || req.socket.remoteAddress || '').slice(0, 100),
-    });
+    ws.ctx = { kind: 'agent', projectId: p.id, agent: def.name, mode };
+    st.conns.add(ws);
+    if (Array.isArray(data.caps) && data.caps.includes('ack')) st.ackCapable = true;
+    else if (mode === 'listener') st.ackCapable = false;
+    st.lastActivity = Date.now();
+    if (mode !== 'tool') {
+      st.since = Date.now();
+      st.host = String(data.host || req.socket.remoteAddress || '').slice(0, 100);
+      st.lastMode = mode;
+    }
+    if (mode === 'wait') setAgentStatus(st, 'idle', '等待新消息');
     const { token, ...self } = def;
+    const n = Math.min(500, Math.max(1, parseInt(data.historyLimit || 100, 10)));
     send({
       type: 'welcome',
       kind: 'agent',
+      mode,
       project: publicProject(p),
       self,
-      history: store.getMessages(p.id).slice(-100),
+      history: store.getMessages(p.id).slice(-n),
+      pending: [...pendingOf(p.id, def.name).keys()],
+      presence: presence(p.id),
     });
-    broadcastPresence(p.id);
+    if (mode !== 'tool') broadcastPresence(p.id);
     return;
   }
   // 用户（网页端）
@@ -344,7 +614,17 @@ function onHello(ws, data, send, req) {
     send({ type: 'error', error: '未授权', fatal: true });
     return ws.close(4001, 'unauthorized');
   }
-  ws.ctx = { kind: 'user', projectId: p.id, name: String(data.name || '用户').slice(0, 32) };
+  if (REQUIRE_ORIGIN && !sameOrigin(req)) {
+    send({ type: 'error', error: '用户身份只能从网页端连接（缺少或不匹配的 Origin）。agent 请使用自己的 token 接入。', fatal: true });
+    return ws.close(4002, 'origin required');
+  }
+  const name = String(data.name || '用户').trim().slice(0, 32) || '用户';
+  const lower = name.toLowerCase();
+  if (p.agents.some((a) => a.name.toLowerCase() === lower) || ['system', '系统', 'all', '所有人'].includes(lower)) {
+    send({ type: 'error', error: `昵称「${name}」与 agent 或保留名重复，请换一个`, fatal: true });
+    return ws.close(4002, 'bad name');
+  }
+  ws.ctx = { kind: 'user', projectId: p.id, name };
   r.users.add(ws);
   const all = store.getMessages(p.id);
   send({
@@ -357,37 +637,63 @@ function onHello(ws, data, send, req) {
   });
 }
 
+function cleanAttachments(projectId, list) {
+  if (!Array.isArray(list)) return [];
+  const re = new RegExp(`^/files/${projectId}/[\\w-]+(\\.[a-z0-9]{1,8})?$`);
+  return list
+    .slice(0, 10)
+    .filter((a) => a && re.test(a.url) && fs.existsSync(path.join(store.uploadDir(projectId), path.basename(a.url))))
+    .map((a) => ({
+      url: a.url,
+      name: String(a.name || path.basename(a.url)).slice(0, 120),
+      size: Number(a.size) || 0,
+      type: a.type === 'image' ? 'image' : 'file',
+    }));
+}
+
 function onMessage(ws, data, send) {
   const ctx = ws.ctx;
+  const st = ctx.kind === 'agent' ? agentState(ctx.projectId, ctx.agent) : null;
+  if (st) st.lastActivity = Date.now();
   switch (data.type) {
     case 'ping':
       return send({ type: 'pong', ts: Date.now() });
     case 'message': {
       const text = String(data.text || '').trim();
-      if (!text) return;
-      if (ctx.kind === 'agent') {
-        postMessage(ctx.projectId, { from: ctx.agent, fromType: 'agent', text, replyTo: data.replyTo });
-      } else {
-        postMessage(ctx.projectId, { from: ctx.name, fromType: 'user', text });
-      }
+      const attachments = cleanAttachments(ctx.projectId, data.attachments);
+      if (!text && !attachments.length) return send({ type: 'error', error: '消息为空', clientId: data.clientId });
+      const msg =
+        ctx.kind === 'agent'
+          ? postMessage(ctx.projectId, { from: ctx.agent, fromType: 'agent', text, replyTo: data.replyTo, attachments })
+          : postMessage(ctx.projectId, { from: ctx.name, fromType: 'user', text, attachments });
+      if (data.clientId) send({ type: 'sent', clientId: data.clientId, id: msg.id });
+      return;
+    }
+    case 'ack': {
+      // agent 确认接单：ids 为开始处理的消息
+      if (!st) return;
+      const ids = (Array.isArray(data.ids) ? data.ids : [data.id]).filter(Boolean).map(String);
+      ackMessages(ctx.projectId, ctx.agent, ids);
+      if (ctx.mode === 'wait' && ids.length) setAgentStatus(st, 'working', data.note || '处理新消息');
+      broadcastPresence(ctx.projectId);
+      if (data.clientId) send({ type: 'acked', clientId: data.clientId });
       return;
     }
     case 'status': {
-      if (ctx.kind !== 'agent') return;
-      const c = room(ctx.projectId).agents.get(ctx.agent);
-      if (!c) return;
-      c.status = ['idle', 'working', 'error'].includes(data.status) ? data.status : 'idle';
-      c.note = String(data.note || '').slice(0, 200);
+      if (!st) return;
+      setAgentStatus(st, data.status, data.note);
       broadcastPresence(ctx.projectId);
+      if (data.clientId) send({ type: 'acked', clientId: data.clientId });
       return;
     }
     case 'control': {
-      // 用户 -> agent 的控制指令（目前支持 cancel：中止正在执行的任务；reset：清空会话）
+      // 用户 -> agent 的控制指令（cancel：中止正在执行的任务；reset：清空会话）
       if (ctx.kind !== 'user') return;
-      const c = room(ctx.projectId).agents.get(data.agent);
-      if (!c) return send({ type: 'error', error: `${data.agent} 不在线` });
+      const target = room(ctx.projectId).agents.get(data.agent);
+      const listeners = target ? connsOf(target, 'listener') : [];
+      if (!listeners.length) return send({ type: 'error', error: `${data.agent} 没有在线的连接器，无法远程控制` });
       if (!['cancel', 'reset'].includes(data.action)) return;
-      c.ws.send(JSON.stringify({ type: 'control', action: data.action, by: ctx.name }));
+      for (const l of listeners) l.send(JSON.stringify({ type: 'control', action: data.action, by: ctx.name }));
       return;
     }
     default:

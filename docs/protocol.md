@@ -6,61 +6,88 @@
 
 ```jsonc
 // agent → server
-{ "type": "hello", "kind": "agent", "projectId": "abc123", "agent": "后端", "token": "<agent token>", "host": "my-mac" }
-// 网页用户 → server（token 为 ADMIN_TOKEN，未设置时可省略）
+{
+  "type": "hello", "kind": "agent", "projectId": "abc123", "agent": "后端", "token": "<agent token>",
+  "mode": "listener",      // listener：常驻监听（连接器）| wait：等待下一条 @（room wait）| tool：一次性命令
+  "caps": ["ack"],         // 声明支持接单回执；不声明的旧客户端"发言即视为接单"
+  "historyLimit": 100,     // welcome 里带多少条历史（1-500）
+  "host": "my-mac"
+}
+// 网页用户 → server（token 为 ADMIN_TOKEN；必须来自浏览器，Origin 与 Host 一致）
 { "type": "hello", "kind": "user", "projectId": "abc123", "token": "<ADMIN_TOKEN>", "name": "老板" }
 ```
+
+同一 agent 可以同时有多个连接：`listener` 和 `wait` 各只保留最新的一个（旧的以 4009 关闭），`tool` 不限。
 
 服务端回复：
 
 ```jsonc
-{ "type": "welcome", "kind": "agent", "project": {...}, "self": { "name", "type", "role" }, "history": [Message...] }
-{ "type": "welcome", "kind": "user",  "project": {...}, "history": [...], "hasMore": false, "presence": [...] }
+{ "type": "welcome", "kind": "agent", "mode": "listener", "project": {...}, "self": {...},
+  "history": [Message...], "pending": ["未接单的消息id"...], "presence": [...] }
+{ "type": "welcome", "kind": "user", "project": {...}, "history": [...], "hasMore": false, "presence": [...] }
 ```
 
 ## 客户端 → 服务端
 
+带 `clientId` 的请求，服务端会回 `sent` / `acked` / `error`（同 `clientId`）。
+
 | type | 发送方 | 字段 | 说明 |
 |---|---|---|---|
-| `message` | 两者 | `text`, `replyTo?` | 发一条群消息；agent 用 `replyTo` 指明回复的触发消息（用于计算接力深度） |
-| `status` | agent | `status: idle\|working\|error`, `note?` | 更新在线状态，网页上显示"正在工作" |
-| `control` | 用户 | `agent`, `action: cancel\|reset` | 中止 agent 当前任务 / 重置其 CLI 会话 |
+| `message` | 两者 | `text`, `attachments?`, `replyTo?` | 发群消息；agent 用 `replyTo` 指明回复的触发消息（用于接力深度） |
+| `ack` | agent | `ids`, `note?` | **接单回执**：开始处理这些消息。`wait` 连接回执后状态自动变为 working |
+| `status` | agent | `status: idle\|working\|error`, `note?` | 更新状态 |
+| `control` | 用户 | `agent`, `action: cancel\|reset` | 中止 agent 当前任务 / 重置 CLI 会话（只对连接器有效） |
 | `ping` | 两者 | – | 应用层心跳，服务端回 `pong` |
 
 ## 服务端 → 客户端
 
 | type | 说明 |
 |---|---|
-| `message` | 新消息，`message` 字段为 Message |
-| `presence` | （仅用户）各 agent 在线 / 工作状态 |
-| `project` | 项目配置变化（分工修改、暂停等） |
-| `control` | （仅 agent）用户发来的控制指令 |
+| `message` | 新消息 |
+| `presence` | （仅用户）各 agent 状态：`online` `listening` `mode`(connector/session) `status` `note` `pending`(待接单数) |
+| `project` | 项目配置变化 |
+| `control` | （仅 listener）用户的控制指令 |
+| `sent` / `acked` | 对带 `clientId` 请求的确认 |
 | `error` | 错误；`fatal: true` 时随后断开 |
 
 ## Message
 
 ```jsonc
 {
-  "id": "x1y2z3",
-  "projectId": "abc123",
-  "from": "后端",              // agent 名称 / 用户昵称 / system
-  "fromType": "agent",         // agent | user | system
+  "id": "x1y2z3", "projectId": "abc123",
+  "from": "后端", "fromType": "agent",            // agent | user | system
   "text": "@前端 接口已完成…",
-  "mentions": ["前端"],        // 文本中 @ 到的 agent
-  "dispatch": ["前端"],        // 真正需要响应的 agent（暂停或超出接力上限时为空）
-  "replyTo": "prev-id",
-  "depth": 2,                  // 用户消息为 0，agent 回复 = 触发消息 depth + 1
-  "ts": 1731400000000
+  "mentions": ["前端"],                             // 文本中 @ 到的 agent
+  "dispatch": ["前端"],                             // 真正需要响应的 agent（暂停或超出接力上限时为空）
+  "attachments": [{ "url": "/files/abc123/xxxx.png", "name": "shot.png", "size": 1234, "type": "image" }],
+  "replyTo": "prev-id", "depth": 2, "ts": 1731400000000,
+  "meta": { "kind": "ack-timeout", "agent": "前端", "ids": [...] }   // 系统消息的类型：ack-timeout / ack-late
 }
 ```
 
-agent 只需响应 `dispatch` 包含自己的消息。当 `depth >= maxHops` 时服务端不再派发，并发一条系统提示，等待用户介入，防止 agent 之间无限互相 @。
+## 接单回执与超时
+
+- 消息派发给某 agent 后进入它的"待接单"列表，直到它 `ack`（旧客户端：发言）。
+- 连接器正在忙（listener + working）时不计时；连接器空闲时从空闲时刻起计时。
+- 有 `wait` 连接时不计时（马上会被拿走）。
+- 会话模式正在处理其他任务（无监听连接但 working）时，超时放宽到 10 倍。
+- 超过项目的 `ackTimeoutSec` 后，群里发一条 `meta.kind = "ack-timeout"` 的系统消息说明原因；之后接单会发 `ack-late`。
+- 待接单记录持久化在 `DATA_DIR/pending.json`。
+
+## HTTP
+
+| 方法 | 路径 | 鉴权 | 说明 |
+|---|---|---|---|
+| POST | `/api/projects/:id/uploads?name=文件名` | `Bearer <ADMIN_TOKEN>` 或 `Agent <agent token>` | 上传附件（原始字节，≤20MB），返回 `{ attachment }` |
+| GET | `/files/:projectId/:fileId.ext` | 无（文件名不可猜测） | 下载附件；图片/文本/PDF 内联，其它类型强制下载 |
+| GET | `/agent/{connector,room,common}.js` | 无 | 下载 agent 工具 |
 
 ## 关闭码
 
 | code | 含义 |
 |---|---|
 | 4001 | 未授权 / hello 超时 |
+| 4002 | 用户连接被拒：非浏览器 Origin，或昵称与 agent 重名 |
 | 4003 | agent 名称或 token 错误 / agent 已被移除 |
 | 4004 | 项目不存在或已删除 |
-| 4009 | 同名 agent 在别处登录，本连接被替换 |
+| 4009 | 同名同模式的连接在别处上线，本连接被替换 |

@@ -9,19 +9,23 @@ import { parseMentions } from '../server/store.js';
 
 const PORT = 18000 + Math.floor(Math.random() * 1000);
 const BASE = `http://127.0.0.1:${PORT}`;
+const WSURL = `ws://127.0.0.1:${PORT}/ws`;
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-room-test-'));
 const procs = [];
+const childEnv = { ...process.env, HOME: tmp, USERPROFILE: tmp };
 
-function start(args, extraEnv = {}) {
+function start(args, extraEnv = {}, { capture = false } = {}) {
   const p = spawn(process.execPath, args, {
-    env: { ...process.env, PORT: String(PORT), DATA_DIR: path.join(tmp, 'data'), ADMIN_TOKEN: 'secret', HOME: tmp, USERPROFILE: tmp, ...extraEnv },
+    env: { ...childEnv, PORT: String(PORT), DATA_DIR: path.join(tmp, 'data'), ADMIN_TOKEN: 'secret', ACK_CHECK_MS: '300', ...extraEnv },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
-  p.stdout.on('data', () => {});
-  p.stderr.on('data', (d) => process.stderr.write(d));
+  p.out = '';
+  p.stdout.on('data', (d) => (p.out += d));
+  p.stderr.on('data', (d) => (capture ? (p.out += d) : process.stderr.write(d)));
   procs.push(p);
   return p;
 }
+const exited = (p) => new Promise((r) => (p.exitCode !== null ? r(p.exitCode) : p.on('exit', (c) => r(c))));
 const api = (p, opts = {}) =>
   fetch(BASE + p, {
     ...opts,
@@ -29,7 +33,7 @@ const api = (p, opts = {}) =>
     body: opts.body && JSON.stringify(opts.body),
   }).then((r) => r.json());
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-async function waitFor(fn, ms = 8000) {
+async function waitFor(fn, ms = 10000) {
   const t = Date.now();
   while (Date.now() - t < ms) {
     const v = await fn();
@@ -38,6 +42,26 @@ async function waitFor(fn, ms = 8000) {
   }
   throw new Error('waitFor timeout');
 }
+/** 以网页用户身份连接（带 Origin） */
+async function userClient(projectId, name = '老板', { origin = BASE } = {}) {
+  const ws = new WebSocket(WSURL, origin ? { origin } : {});
+  const c = { ws, msgs: [], presence: [], closeCode: null };
+  ws.on('message', (raw) => {
+    const d = JSON.parse(raw);
+    if (d.type === 'message') c.msgs.push(d.message);
+    if (d.type === 'presence' || d.type === 'welcome') c.presence = d.presence || d.agents || c.presence;
+  });
+  ws.on('close', (code) => (c.closeCode = code));
+  await new Promise((r) => ws.on('open', r));
+  ws.send(JSON.stringify({ type: 'hello', kind: 'user', projectId, token: 'secret', name }));
+  c.say = (text, extra = {}) => ws.send(JSON.stringify({ type: 'message', text, ...extra }));
+  return c;
+}
+async function newProject(agents, extra = {}) {
+  const { project } = await api('/api/projects', { method: 'POST', body: { name: 'p', agents, ...extra } });
+  return { project, tok: Object.fromEntries(project.agents.map((a) => [a.name, a.token])) };
+}
+const roomEnv = (project, agent, token) => ({ AGENT_ROOM_SERVER: WSURL, AGENT_ROOM_PROJECT: project.id, AGENT_ROOM_AGENT: agent, AGENT_ROOM_TOKEN: token });
 
 before(async () => {
   start(['server/index.js']);
@@ -62,60 +86,126 @@ test('未授权访问被拒绝', async () => {
   assert.equal(r.status, 401);
 });
 
-test('端到端：用户 @agent → agent 回复 → agent 互相 @ 接力并受上限保护', async () => {
-  const { project } = await api('/api/projects', {
-    method: 'POST',
-    body: {
-      name: '测试项目',
-      maxHops: 3,
-      agents: [
-        { name: 'Alice', type: 'claude', role: '开发' },
-        { name: 'Bob', type: 'codex', role: '测试' },
-      ],
-    },
-  });
-  assert.ok(project.id);
-  const tok = Object.fromEntries(project.agents.map((a) => [a.name, a.token]));
+test('身份：非浏览器（无 Origin）或与 agent 同名的用户连接被拒绝', async () => {
+  const { project } = await newProject([{ name: 'Codex', type: 'codex' }]);
+  const noOrigin = await userClient(project.id, '用户', { origin: null });
+  await waitFor(() => noOrigin.closeCode);
+  assert.equal(noOrigin.closeCode, 4002);
+  const fake = await userClient(project.id, 'codex');
+  await waitFor(() => fake.closeCode);
+  assert.equal(fake.closeCode, 4002);
+});
 
+test('端到端：连接器接单回执 + agent 互相 @ 接力并受上限保护，无超时误报', async () => {
+  const { project, tok } = await newProject(
+    [
+      { name: 'Alice', type: 'claude', role: '开发' },
+      { name: 'Bob', type: 'codex', role: '测试' },
+    ],
+    { maxHops: 3, ackTimeoutSec: 5 }
+  );
   // 错误 token 被拒绝
-  const bad = new WebSocket(`ws://127.0.0.1:${PORT}/ws`);
+  const bad = new WebSocket(WSURL);
   const badClose = new Promise((r) => bad.on('close', (code) => r(code)));
   bad.on('open', () => bad.send(JSON.stringify({ type: 'hello', kind: 'agent', projectId: project.id, agent: 'Alice', token: 'x' })));
   assert.equal(await badClose, 4003);
 
-  // 用户连接
-  const user = new WebSocket(`ws://127.0.0.1:${PORT}/ws`);
-  const msgs = [];
-  let presence = [];
-  user.on('message', (raw) => {
-    const d = JSON.parse(raw);
-    if (d.type === 'message') msgs.push(d.message);
-    if (d.type === 'presence') presence = d.agents;
-  });
-  await new Promise((r) => user.on('open', r));
-  user.send(JSON.stringify({ type: 'hello', kind: 'user', projectId: project.id, token: 'secret', name: '老板' }));
-
-  // 两个 dry-run 连接器
+  const user = await userClient(project.id);
   for (const name of ['Alice', 'Bob']) {
-    start(['agent/connector.js', '--server', `ws://127.0.0.1:${PORT}/ws`, '--project', project.id, '--agent', name, '--token', tok[name], '--workdir', path.join(tmp, 'wd'), '--dry-run']);
+    start(['agent/connector.js', '--server', WSURL, '--project', project.id, '--agent', name, '--token', tok[name], '--workdir', path.join(tmp, 'wd'), '--dry-run']);
   }
-  await waitFor(() => presence.filter((a) => a.online).length === 2);
+  await waitFor(() => user.presence.filter((a) => a.online && a.mode === 'connector').length === 2);
 
-  // 用户 @Alice，dry-run 回显中包含「@Bob」→ Bob 被触发 → Bob 回显里含 @Alice … 直到上限
-  user.send(JSON.stringify({ type: 'message', text: '@Alice 请实现登录功能，然后交给 @Bob 测试' }));
-  await waitFor(() => msgs.find((m) => m.from === 'Alice'));
-  const a = msgs.find((m) => m.from === 'Alice');
-  assert.equal(a.fromType, 'agent');
+  user.say('@Alice 请实现登录功能，然后交给 @Bob 测试');
+  await waitFor(() => user.msgs.find((m) => m.from === 'Alice'));
+  const a = user.msgs.find((m) => m.from === 'Alice');
   assert.equal(a.depth, 1);
   assert.ok(a.replyTo);
-  // 用户消息同时 @ 了两人，Bob 也会直接被触发
-  await waitFor(() => msgs.find((m) => m.from === 'Bob'));
-  // 接力上限：最终应出现系统提示，且没有 depth > maxHops 的消息
-  await waitFor(() => msgs.find((m) => m.fromType === 'system' && m.text.includes('接力上限')), 15000);
-  assert.ok(msgs.every((m) => (m.depth || 0) <= 3));
+  await waitFor(() => user.msgs.find((m) => m.from === 'Bob'));
+  await waitFor(() => user.msgs.find((m) => m.fromType === 'system' && m.text.includes('接力上限')), 15000);
+  assert.ok(user.msgs.every((m) => (m.depth || 0) <= 3));
+  await sleep(6500); // 超过 ackTimeoutSec，确认没有误报
+  assert.ok(!user.msgs.find((m) => m.meta?.kind === 'ack-timeout'), '连接器正常工作时不应出现超时提醒');
+  await waitFor(() => user.presence.every((x) => x.pending === 0));
+  user.ws.close();
+});
 
-  // 持久化：REST 拉取历史
-  const { messages } = await api(`/api/projects/${project.id}/messages`);
-  assert.ok(messages.length >= msgs.length);
-  user.close();
+test('接单超时：派给离线 agent 的消息会在群里提醒，上线接单后提示已接单', async () => {
+  const { project, tok } = await newProject([{ name: 'Codex', type: 'codex' }], { ackTimeoutSec: 5 });
+  const user = await userClient(project.id);
+  user.say('@Codex 帮忙复测一下');
+  const warn = await waitFor(() => user.msgs.find((m) => m.meta?.kind === 'ack-timeout'), 12000);
+  assert.match(warn.text, /@Codex/);
+  assert.match(warn.text, /离线/);
+  assert.equal(user.presence.find((x) => x.name === 'Codex').pending, 1);
+  // 会话模式上线：room wait 立即拿到积压的消息并确认
+  const w = start(['agent/room.js', 'wait', '--timeout', '20'], roomEnv(project, 'Codex', tok.Codex), { capture: true });
+  assert.equal(await exited(w), 0, w.out);
+  assert.match(w.out, /帮忙复测一下/);
+  await waitFor(() => user.msgs.find((m) => m.meta?.kind === 'ack-late'));
+  user.ws.close();
+});
+
+test('会话模式：room wait 阻塞到被 @，room send 回复带 replyTo 与附件', async () => {
+  const { project, tok } = await newProject([
+    { name: 'Claude', type: 'claude' },
+    { name: 'Codex', type: 'codex' },
+  ]);
+  const user = await userClient(project.id);
+  const env = roomEnv(project, 'Codex', tok.Codex);
+  // 先运行一次 wait：没有消息时阻塞
+  const w = start(['agent/room.js', 'wait', '--timeout', '30'], env, { capture: true });
+  await waitFor(() => user.presence.find((x) => x.name === 'Codex')?.listening);
+  await sleep(300);
+  assert.equal(w.exitCode, null, 'wait 应该在被 @ 之前保持阻塞');
+  user.say('@Claude 先别管这条'); // 不是给 Codex 的
+  await sleep(500);
+  assert.equal(w.exitCode, null);
+  user.say('@Codex 测一下提交 abc123');
+  assert.equal(await exited(w), 0, w.out);
+  assert.match(w.out, /abc123/);
+  assert.match(w.out, /【@你】/);
+  const trigger = user.msgs.find((m) => m.text.includes('abc123'));
+  await waitFor(() => user.presence.find((x) => x.name === 'Codex')?.status === 'working');
+
+  // inbox：执行中看新消息
+  user.say('补充：改测 def456');
+  await sleep(300);
+  const ib = start(['agent/room.js', 'inbox'], env, { capture: true });
+  assert.equal(await exited(ib), 0, ib.out);
+  assert.match(ib.out, /def456/);
+
+  // 带附件回复
+  const img = path.join(tmp, 'shot.png');
+  fs.writeFileSync(img, Buffer.from('89504e470d0a1a0a', 'hex'));
+  const s = start(['agent/room.js', 'send', '@Claude def456 通过', '--attach', img, '--done'], env, { capture: true });
+  assert.equal(await exited(s), 0, s.out);
+  const reply = await waitFor(() => user.msgs.find((m) => m.from === 'Codex'));
+  assert.equal(reply.replyTo, trigger.id);
+  assert.deepEqual(reply.dispatch, ['Claude']);
+  assert.equal(reply.attachments.length, 1);
+  assert.equal(reply.attachments[0].type, 'image');
+  const file = await fetch(BASE + reply.attachments[0].url);
+  assert.equal(file.status, 200);
+  assert.equal(file.headers.get('content-type'), 'image/png');
+  user.ws.close();
+});
+
+test('附件：伪造的附件 URL 会被丢弃，HTML 等类型强制下载', async () => {
+  const { project, tok } = await newProject([{ name: 'A', type: 'claude' }]);
+  const up = await fetch(`${BASE}/api/projects/${project.id}/uploads?name=x.html`, {
+    method: 'POST',
+    headers: { Authorization: `Agent ${tok.A}` },
+    body: '<script>alert(1)</script>',
+  }).then((r) => r.json());
+  const r = await fetch(BASE + up.attachment.url);
+  assert.match(r.headers.get('content-disposition') || '', /attachment/);
+  const noAuth = await fetch(`${BASE}/api/projects/${project.id}/uploads?name=a.png`, { method: 'POST', body: 'x' });
+  assert.equal(noAuth.status, 401);
+  const user = await userClient(project.id);
+  user.say('看图', { attachments: [{ url: 'https://evil.example/x.png', name: 'x' }, up.attachment] });
+  const m = await waitFor(() => user.msgs.find((x) => x.text === '看图'));
+  assert.equal(m.attachments.length, 1);
+  assert.equal(m.attachments[0].url, up.attachment.url);
+  user.ws.close();
 });

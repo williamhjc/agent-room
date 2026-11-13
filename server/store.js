@@ -58,7 +58,7 @@ export class Store {
     });
   }
 
-  createProject({ name, description, workdir, agents, maxHops }) {
+  createProject({ name, description, workdir, agents, maxHops, ackTimeoutSec }) {
     name = String(name || '').trim();
     if (!name) throw new Error('项目名称不能为空');
     const project = {
@@ -67,6 +67,7 @@ export class Store {
       description: String(description || '').trim().slice(0, 4000),
       workdir: String(workdir || '').trim(),
       maxHops: clampInt(maxHops, 1, 100, 12),
+      ackTimeoutSec: clampInt(ackTimeoutSec, 5, 3600, 60),
       paused: false,
       agents: this.validateAgents(agents),
       createdAt: Date.now(),
@@ -83,6 +84,7 @@ export class Store {
     if (patch.description !== undefined) p.description = String(patch.description).slice(0, 4000);
     if (patch.workdir !== undefined) p.workdir = String(patch.workdir).trim();
     if (patch.maxHops !== undefined) p.maxHops = clampInt(patch.maxHops, 1, 100, p.maxHops);
+    if (patch.ackTimeoutSec !== undefined) p.ackTimeoutSec = clampInt(patch.ackTimeoutSec, 5, 3600, p.ackTimeoutSec ?? 60);
     if (patch.paused !== undefined) p.paused = !!patch.paused;
     if (patch.agents !== undefined) {
       // 保留已有 agent 的 token
@@ -100,6 +102,11 @@ export class Store {
     this.messages.delete(id);
     this.saveProjects();
     fs.rmSync(this.msgFile(id), { force: true });
+    fs.rmSync(this.uploadDir(id), { recursive: true, force: true });
+  }
+
+  uploadDir(id) {
+    return path.join(this.dataDir, 'uploads', id);
   }
 
   msgFile(id) {

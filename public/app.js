@@ -1,4 +1,5 @@
 // Agent Room 网页端
+import { headIcon, sceneSVG, sceneState, sceneCaption } from './scenes.js';
 const $ = (s) => document.querySelector(s);
 const esc = (s) =>
   String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
@@ -164,6 +165,7 @@ function connectWs(id) {
     setConn('已断开，重连中…', 'bad');
     if (ev.code === 4004) return toast('项目不存在或已删除');
     if (ev.code === 4001) return showLogin();
+    if (ev.code === 4002) return setConn(ev.reason === 'bad name' ? '昵称冲突，请修改左下角昵称' : '连接被拒绝', 'bad');
     setTimeout(() => S.wsProject === id && connectWs(id), Math.min(1000 * 2 ** retry++, 15000));
   };
 }
@@ -293,7 +295,8 @@ function messageEl(m) {
   const el = document.createElement('div');
   if (m.fromType === 'system') {
     el.className = 'msg system';
-    el.innerHTML = `<div class="sys">${esc(m.text)}</div>`;
+    const k = m.meta?.kind;
+    el.innerHTML = `<div class="sys ${k === 'ack-timeout' ? 'warn' : k === 'ack-late' ? 'ok' : ''}">${esc(m.text)}</div>`;
     return el;
   }
   const isMe = m.fromType === 'user';
@@ -301,20 +304,21 @@ function messageEl(m) {
   const t = new Date(m.ts);
   const time = t.toLocaleString('zh-CN', { hour12: false, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
   const parent = m.replyTo && S.messages.find((x) => x.id === m.replyTo);
-  el.className = `msg ${isMe ? 'me' : ''}`;
+  el.className = `msg ${isMe ? 'me' : `agent-${type}`}`;
   el.innerHTML = `
-    <div class="avatar ${type}" title="${esc(m.from)}">${esc([...m.from][0] || '?')}</div>
+    <div class="avatar ${type}" title="${esc(m.from)}">${headIcon(type, esc([...m.from][0] || '?'))}</div>
     <div class="msg-body">
       <div class="msg-meta">
         <span class="who">${esc(m.from)}</span>
         ${isMe ? '' : `<span class="tag ${type}">${type === 'codex' ? 'Codex' : 'Claude'}</span>`}
-        <span>${time}</span>
+        <span class="time">${time}</span>
       </div>
       ${parent ? `<div class="reply-ref">↪ 回复 ${esc(parent.from)}：${esc(parent.text.slice(0, 40))}${parent.text.length > 40 ? '…' : ''}</div>` : ''}
-      <div class="bubble">${renderMarkdown(m.text, m.mentions)}</div>
+      ${m.text ? `<div class="bubble">${renderMarkdown(m.text, m.mentions)}</div>` : ''}
+      ${renderAttachments(m.attachments)}
     </div>`;
   const bubble = el.querySelector('.bubble');
-  if (m.text.length > 1200 || m.text.split('\n').length > 18) {
+  if (bubble && (m.text.length > 1200 || m.text.split('\n').length > 18)) {
     bubble.classList.add('collapsed');
     const b = document.createElement('button');
     b.className = 'expand';
@@ -327,6 +331,35 @@ function messageEl(m) {
   }
   return el;
 }
+function renderAttachments(list) {
+  if (!list?.length) return '';
+  return `<div class="atts">${list
+    .map((a) =>
+      a.type === 'image'
+        ? `<img src="${esc(a.url)}" alt="${esc(a.name)}" title="${esc(a.name)}" loading="lazy" data-zoom />`
+        : `<a class="att-file" href="${esc(a.url)}?download=1&name=${encodeURIComponent(a.name)}" target="_blank" rel="noopener">📄 ${esc(a.name)} <span class="muted small">${fmtSize(a.size)}</span></a>`
+    )
+    .join('')}</div>`;
+}
+function fmtSize(n) {
+  if (!n) return '';
+  return n > 1048576 ? (n / 1048576).toFixed(1) + 'MB' : Math.max(1, Math.round(n / 1024)) + 'KB';
+}
+$('#messages').addEventListener('click', (e) => {
+  const img = e.target.closest('img[data-zoom]');
+  if (!img) return;
+  const lb = document.createElement('div');
+  lb.className = 'lightbox';
+  lb.innerHTML = `<img src="${esc(img.src)}" />`;
+  lb.onclick = () => lb.remove();
+  document.body.appendChild(lb);
+});
+$('#messages').addEventListener('load', (e) => e.target.matches?.('img[data-zoom]') && isNearBottom(400) && scrollBottom(), true);
+function isNearBottom(px) {
+  const b = $('#messages');
+  return b.scrollHeight - b.scrollTop - b.clientHeight < px;
+}
+
 function renderMessages(toBottom) {
   const box = $('#messages');
   box.innerHTML = '';
@@ -370,37 +403,74 @@ function renderWorking() {
   const bar = $('#workingBar');
   bar.classList.toggle('hidden', !w.length);
   bar.innerHTML = w
-    .map((a) => `<span class="w"><span class="dots"><i></i><i></i><i></i></span>@${esc(a.name)} 正在工作${a.note ? `（${esc(a.note)}）` : ''}</span>`)
+    .map((a) => `<span class="w"><span class="mini">${headIcon(a.type)}</span><span class="dots"><i></i><i></i><i></i></span>@${esc(a.name)} 正在搬砖${a.note ? `（${esc(a.note)}）` : ''}</span>`)
     .join('');
 }
 
 // ---------- 成员面板 ----------
 const STATUS_TEXT = { offline: '离线', idle: '在线 · 空闲', working: '工作中', error: '出错' };
+const MODE_TEXT = { connector: '连接器', session: '交互会话' };
+// 卡片按 agent 复用；场景 SVG 只在状态变化时替换，避免每次在线状态更新都让动画重播
+const memberCards = new Map(); // name -> { el, sceneKey }
+let memberListKey = '';
 function renderMembers() {
   const p = S.current;
   if (!p) return;
-  const pres = new Map(S.presence.map((a) => [a.name, a]));
-  $('#memberList').innerHTML = p.agents
-    .map((a) => {
-      const st = pres.get(a.name) || { status: 'offline' };
-      return `<div class="member">
-        <div class="member-top">
-          <div class="avatar ${a.type}">${esc([...a.name][0])}<span class="status-dot ${st.status}"></span></div>
-          <div style="flex:1;min-width:0">
-            <div class="member-name">@${esc(a.name)} <span class="tag ${a.type}">${a.type === 'codex' ? 'Codex' : 'Claude'}</span></div>
-            <div class="member-status">${STATUS_TEXT[st.status] || st.status}${st.host ? ` · ${esc(st.host)}` : ''}${st.note && st.status !== 'idle' ? ` · ${esc(st.note)}` : ''}</div>
+  const listKey = p.id + '|' + p.agents.map((a) => `${a.name}:${a.type}:${a.role}`).join('|');
+  if (listKey !== memberListKey) {
+    memberListKey = listKey;
+    memberCards.clear();
+    const box = $('#memberList');
+    box.innerHTML = '';
+    for (const a of p.agents) {
+      const el = document.createElement('div');
+      el.className = 'member';
+      el.innerHTML = `
+        <div class="stage"><div class="stage-scene"></div></div>
+        <div class="stage-caption"></div>
+        <div class="member-info">
+          <div class="member-top">
+            <div class="avatar ${a.type}">${headIcon(a.type)}<span class="status-dot"></span></div>
+            <div style="flex:1;min-width:0">
+              <div class="member-name"></div>
+              <div class="member-status"></div>
+            </div>
           </div>
-        </div>
-        <div class="member-role">${esc(a.role || '（未定义分工）')}</div>
-        <div class="member-actions">
-          <button class="btn xs" data-act="at" data-name="${esc(a.name)}">@他</button>
-          <button class="btn xs" data-act="connect" data-name="${esc(a.name)}">连接命令</button>
-          ${st.status === 'working' ? `<button class="btn xs danger-text" data-act="cancel" data-name="${esc(a.name)}">中止</button>` : ''}
-          ${st.online ? `<button class="btn xs" data-act="reset" data-name="${esc(a.name)}" title="清空该 agent 的 CLI 会话上下文">重置会话</button>` : ''}
-        </div>
-      </div>`;
-    })
-    .join('');
+          <div class="member-role">${esc(a.role || '（未定义分工）')}</div>
+          <div class="member-actions"></div>
+        </div>`;
+      box.appendChild(el);
+      memberCards.set(a.name, { el, sceneKey: '' });
+    }
+  }
+  const pres = new Map(S.presence.map((a) => [a.name, a]));
+  for (const a of p.agents) {
+    const card = memberCards.get(a.name);
+    const st = pres.get(a.name) || { status: 'offline' };
+    const state = sceneState(st);
+    const key = `${state}|${a.type}|${Math.min(st.pending || 0, 10)}`;
+    const el = card.el;
+    el.className = `member st-${state}`;
+    if (card.sceneKey !== key) {
+      card.sceneKey = key;
+      el.querySelector('.stage-scene').innerHTML = sceneSVG(a.type, state, st);
+    }
+    el.querySelector('.stage-caption').textContent = sceneCaption(state, st);
+    el.querySelector('.status-dot').className = `status-dot ${st.online ? st.status : 'offline'}`;
+    el.querySelector('.member-name').innerHTML = `@${esc(a.name)} <span class="tag ${a.type}">${a.type === 'codex' ? 'Codex' : 'Claude'}</span>${
+      st.mode ? `<span class="mode-tag">${MODE_TEXT[st.mode] || st.mode}</span>` : ''
+    }${st.pending ? `<span class="pend" title="已派发但还没接单的消息">${st.status === 'working' ? '排队' : '待接单'} ${st.pending}</span>` : ''}`;
+    el.querySelector('.member-status').textContent = `${statusText(st)}${st.host ? ` · ${st.host}` : ''}`;
+    el.querySelector('.member-actions').innerHTML = `
+      <button class="btn xs" data-act="at" data-name="${esc(a.name)}">@它</button>
+      <button class="btn xs" data-act="connect" data-name="${esc(a.name)}">接入方式</button>
+      ${st.status === 'working' && st.mode === 'connector' ? `<button class="btn xs danger-text" data-act="cancel" data-name="${esc(a.name)}">中止</button>` : ''}
+      ${st.mode === 'connector' && st.listening ? `<button class="btn xs" data-act="reset" data-name="${esc(a.name)}" title="清空该 agent 的 CLI 会话上下文">重置会话</button>` : ''}`;
+  }
+}
+function statusText(st) {
+  if (st.status === 'idle' && st.mode === 'session') return st.listening ? '在线 · 等待消息' : '未在监听';
+  return STATUS_TEXT[st.status] || st.status;
 }
 $('#memberList').addEventListener('click', (e) => {
   const b = e.target.closest('button[data-act]');
@@ -428,32 +498,86 @@ $('#mentionChips').addEventListener('click', (e) => {
 
 // ---------- 连接命令 ----------
 let connOs = 'unix';
+let connMode = 'connector';
 let connAgent = null;
-function connectCmd(a, os) {
+function serverBase() {
+  return (S.publicUrl || location.origin).replace(/\/$/, '');
+}
+function wsUrl() {
+  return serverBase().replace(/^http/, 'ws') + '/ws';
+}
+function q(s, os) {
+  return os === 'ps' ? `'${s.replace(/'/g, "''")}'` : `'${s.replace(/'/g, `'\\''`)}'`;
+}
+function dlCmd(os) {
+  const b = serverBase();
+  if (os === 'ps') {
+    return (
+      '$d = "$HOME\\.agent-room\\bin"; New-Item -ItemType Directory -Force $d | Out-Null\n' +
+      `foreach ($f in 'connector','room','common') { Invoke-WebRequest "${b}/agent/$f.js" -OutFile "$d\\$f.js" }`
+    );
+  }
+  return `mkdir -p ~/.agent-room/bin && for f in connector room common; do \\\n  curl -fsS "${b}/agent/$f.js" -o ~/.agent-room/bin/$f.js; done`;
+}
+function toolPath(os, file) {
+  return os === 'ps' ? `$HOME\\.agent-room\\bin\\${file}` : `~/.agent-room/bin/${file}`;
+}
+function runCmd(a, os, mode) {
   const p = S.current;
-  const wsUrl = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`;
   const wd = p.workdir || (os === 'ps' ? 'D:\\path\\to\\project' : '/path/to/project');
-  const q = (s) => (os === 'ps' ? `'${s.replace(/'/g, "''")}'` : `'${s.replace(/'/g, `'\\''`)}'`);
   const nl = os === 'ps' ? ' `\n  ' : ' \\\n  ';
-  return (
-    `node agent/connector.js` +
-    `${nl}--server ${wsUrl}` +
-    `${nl}--project ${p.id}` +
-    `${nl}--agent ${q(a.name)}` +
-    `${nl}--token ${a.token}` +
-    `${nl}--workdir ${q(wd)}`
-  );
+  const common = `${nl}--server ${wsUrl()}${nl}--project ${p.id}${nl}--agent ${q(a.name, os)}${nl}--token ${a.token}`;
+  if (mode === 'connector') return `node ${toolPath(os, 'connector.js')}${common}${nl}--workdir ${q(wd, os)}`;
+  return `cd ${q(wd, os)}\nnode ${toolPath(os, 'room.js')} init${common}`;
+}
+function sessionPrompt(a, os) {
+  const p = S.current;
+  const room = `node ${toolPath(os, 'room.js')}`;
+  const others = p.agents
+    .filter((x) => x.name !== a.name)
+    .map((x) => `@${x.name}（${(x.role || '未定义').split('\n')[0].slice(0, 40)}）`)
+    .join('、');
+  return `你现在是 Agent Room 多 agent 协作群「${p.name}」里的成员 @${a.name}。
+你的分工：${a.role || '未定义'}
+其他成员：${others || '无'}
+
+在项目目录里用下面的命令和团队协作（连接信息已由 room init 保存在当前目录的 .agent-room.json）：
+- 等任务：${room} wait —— 会一直阻塞到有人 @你 才返回。请把这条命令的超时设成工具允许的最大值（如 10 分钟）；如果超时、被中断或返回码为 3，直接再运行一次。
+- 回复：${room} send "内容"（需要别人接手就在内容里 @对方；截图/文件用 --attach 路径，不要贴 base64）
+- 干活中途看新消息：${room} inbox（需求可能变了，例如有了更新的提交号；过时的任务不要继续做）
+- 其他：${room} who 看成员状态；${room} show <id> 看长消息全文；${room} get <附件URL> 下载附件
+
+工作循环（务必遵守）：
+1. 运行 room wait 拿到任务；
+2. 完成你分工内的工作；
+3. 用 room send 把结论发到群里；
+4. 立刻回到第 1 步继续 room wait。不要结束对话、不要停下来等我输入——群里的人只能通过 @你 找到你，你不 wait 就收不到消息。
+
+只用你自己的身份 @${a.name} 发言，绝不冒充用户或其他成员。现在开始：运行 room wait。`;
 }
 function showConnect(name) {
   connAgent = S.current.agents.find((a) => a.name === name);
-  $('#connTitle').textContent = `连接 @${name}`;
-  $('#connCli').textContent = connAgent.type === 'codex' ? 'codex' : 'claude';
+  $('#connTitle').textContent = `接入 @${name}`;
   renderConnCmd();
   $('#connectDialog').showModal();
 }
 function renderConnCmd() {
-  $('#connCmd').textContent = connectCmd(connAgent, connOs);
+  const cli = connAgent.type === 'codex' ? 'codex' : 'claude';
+  $('#connDesc').innerHTML =
+    connMode === 'connector'
+      ? `常驻进程监听群消息，被 @ 时自动调用本机 <code>${cli}</code> CLI 在项目目录干活，干完把结果发回群里。最稳定，无需人工值守；需要该机器已安装并登录 ${cli} CLI。`
+      : '让一个已经打开的交互式 Codex / Claude Code 会话加入群聊：它通过 <code>room wait</code> 等待 @，干完活用 <code>room send</code> 回复。适合需要桌面权限、MCP 等交互环境的场景，会话必须保持运行。';
+  $('#connDl').textContent = dlCmd(connOs);
+  $('#connStep2').textContent = connMode === 'connector' ? '② 启动连接器（保持运行，断线会自动重连）' : '② 在项目目录保存连接信息';
+  $('#connCmd').textContent = runCmd(connAgent, connOs, connMode);
+  $('#connPromptWrap').classList.toggle('hidden', connMode !== 'session');
+  $('#connPrompt').textContent = sessionPrompt(connAgent, connOs);
+  $('#connOpts').innerHTML =
+    connMode === 'connector'
+      ? '可选参数：<code>--yolo</code> 跳过所有权限确认（全自动）、<code>--model</code> 指定模型、<code>--permission</code> 权限模式、<code>--timeout</code> 单次任务超时（分钟）、<code>--dry-run</code> 不调用 CLI 只回显（联调用）。'
+      : '提示：会话做完一轮后如果没有再运行 room wait，派给它的消息超过「接单超时」后群里会出现黄色提醒，此时回到该会话让它继续 room wait 即可。';
   document.querySelectorAll('#connTabs .tab').forEach((t) => t.classList.toggle('active', t.dataset.os === connOs));
+  document.querySelectorAll('#connModes .tab').forEach((t) => t.classList.toggle('active', t.dataset.mode === connMode));
 }
 $('#connTabs').addEventListener('click', (e) => {
   const t = e.target.closest('.tab');
@@ -461,9 +585,17 @@ $('#connTabs').addEventListener('click', (e) => {
   connOs = t.dataset.os;
   renderConnCmd();
 });
+$('#connModes').addEventListener('click', (e) => {
+  const t = e.target.closest('.tab');
+  if (!t) return;
+  connMode = t.dataset.mode;
+  renderConnCmd();
+});
 $('#btnCopy').onclick = async () => {
+  const parts = [$('#connDl').textContent, $('#connCmd').textContent];
+  if (connMode === 'session') parts.push('# 发给会话的提示：\n' + $('#connPrompt').textContent);
   try {
-    await navigator.clipboard.writeText($('#connCmd').textContent);
+    await navigator.clipboard.writeText(parts.join('\n\n'));
     toast('已复制');
   } catch {
     toast('复制失败，请手动选择');
@@ -508,7 +640,7 @@ function updatePop() {
   el.innerHTML = pop.items
     .map(
       (a, i) =>
-        `<div class="opt ${i === pop.idx ? 'active' : ''}" data-i="${i}"><span class="avatar ${a.type}" style="width:22px;height:22px;font-size:11px;border-radius:6px">${esc([...a.name][0])}</span><b>@${esc(a.name)}</b><span class="r">${esc((a.role || '').split('\n')[0])}</span></div>`
+        `<div class="opt ${i === pop.idx ? 'active' : ''}" data-i="${i}"><span class="avatar ${a.type}">${headIcon(a.type, '@')}</span><b>@${esc(a.name)}</b><span class="r">${esc((a.role || '').split('\n')[0])}</span></div>`
     )
     .join('');
   el.classList.remove('hidden');
@@ -562,12 +694,97 @@ input.addEventListener('keydown', (e) => {
 $('#btnSend').onclick = sendMsg;
 function sendMsg() {
   const text = input.value.trim();
-  if (!text) return;
+  if (S.attachments.some((a) => a.uploading)) return toast('附件还在上传…');
+  const attachments = S.attachments.map((a) => a.att);
+  if (!text && !attachments.length) return;
   if (!S.ws || S.ws.readyState !== 1) return toast('未连接到服务器');
-  S.ws.send(JSON.stringify({ type: 'message', text }));
+  S.ws.send(JSON.stringify({ type: 'message', text, attachments }));
   input.value = '';
+  S.attachments = [];
+  renderAttachList();
   autosize();
 }
+
+// ---------- 附件 ----------
+S.attachments = []; // { id, name, preview, uploading, att }
+let attSeq = 0;
+function renderAttachList() {
+  const box = $('#attachList');
+  box.classList.toggle('hidden', !S.attachments.length);
+  box.innerHTML = S.attachments
+    .map(
+      (a) => `<div class="attach-item ${a.uploading ? 'uploading' : ''}" data-id="${a.id}">
+        ${a.preview ? `<img src="${a.preview}" />` : '📄'}<span class="an">${esc(a.name)}</span>
+        <button class="x" title="移除">✕</button></div>`
+    )
+    .join('');
+}
+$('#attachList').addEventListener('click', (e) => {
+  const item = e.target.closest('.x') && e.target.closest('.attach-item');
+  if (!item) return;
+  S.attachments = S.attachments.filter((a) => String(a.id) !== item.dataset.id);
+  renderAttachList();
+});
+async function addFiles(files) {
+  if (!S.current) return;
+  for (const file of files) {
+    if (file.size > 20 * 1024 * 1024) {
+      toast(`${file.name} 超过 20MB`);
+      continue;
+    }
+    const item = {
+      id: ++attSeq,
+      name: file.name || 'image.png',
+      uploading: true,
+      preview: file.type.startsWith('image/') ? URL.createObjectURL(file) : '',
+    };
+    S.attachments.push(item);
+    renderAttachList();
+    try {
+      const res = await fetch(`/api/projects/${S.current.id}/uploads?name=${encodeURIComponent(item.name)}`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${S.token}`, 'Content-Type': file.type || 'application/octet-stream' },
+        body: file,
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || res.status);
+      item.att = data.attachment;
+      item.uploading = false;
+    } catch (err) {
+      toast(`上传失败：${err.message}`);
+      S.attachments = S.attachments.filter((a) => a !== item);
+    }
+    renderAttachList();
+  }
+}
+$('#btnAttach').onclick = () => $('#fileInput').click();
+$('#fileInput').addEventListener('change', (e) => {
+  addFiles([...e.target.files]);
+  e.target.value = '';
+});
+input.addEventListener('paste', (e) => {
+  const files = [...(e.clipboardData?.files || [])];
+  if (!files.length) return;
+  e.preventDefault();
+  addFiles(
+    files.map((f, i) =>
+      f.name && f.name !== 'image.png' ? f : new File([f], `粘贴图片-${Date.now()}-${i}.${f.type.split('/')[1] || 'png'}`, { type: f.type })
+    )
+  );
+});
+const chatEl = $('#chat');
+chatEl.addEventListener('dragover', (e) => {
+  if (!S.current || !e.dataTransfer?.types?.includes('Files')) return;
+  e.preventDefault();
+  chatEl.classList.add('drop-hint');
+});
+chatEl.addEventListener('dragleave', (e) => e.target === chatEl && chatEl.classList.remove('drop-hint'));
+chatEl.addEventListener('drop', (e) => {
+  chatEl.classList.remove('drop-hint');
+  if (!S.current || !e.dataTransfer?.files?.length) return;
+  e.preventDefault();
+  addFiles([...e.dataTransfer.files]);
+});
 
 // ---------- 昵称 ----------
 $('#userName').value = S.userName;
@@ -625,6 +842,7 @@ function openProjectDialog(project) {
   f.description.value = project?.description || '';
   f.workdir.value = project?.workdir || '';
   f.maxHops.value = project?.maxHops || 12;
+  f.ackTimeoutSec.value = project?.ackTimeoutSec || 60;
   setRoles(project ? project.agents : PRESETS.fullstack);
   $('#projectDialog').showModal();
   f.name.focus();
@@ -645,6 +863,7 @@ $('#projectForm').addEventListener('submit', async (e) => {
     description: f.description.value,
     workdir: f.workdir.value,
     maxHops: f.maxHops.value,
+    ackTimeoutSec: f.ackTimeoutSec.value,
     agents,
   };
   try {
@@ -686,6 +905,10 @@ $('#btnCloseMembers').onclick = () => $('#members').classList.remove('open');
 
 // ---------- 启动 ----------
 async function boot() {
+  try {
+    const cfg = await fetch('/api/config').then((r) => r.json());
+    S.publicUrl = cfg.publicUrl || '';
+  } catch {}
   try {
     await loadProjects();
   } catch {
