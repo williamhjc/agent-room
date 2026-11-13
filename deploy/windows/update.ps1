@@ -35,11 +35,14 @@ Start-Sleep -Seconds 2
 Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue |
   ForEach-Object { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }
 Start-ScheduledTask -TaskName AgentRoom-App
-Start-Sleep -Seconds 4
-try {
-  Invoke-WebRequest "http://127.0.0.1:$Port/healthz" -UseBasicParsing | Out-Null
+$ok = $false
+for ($i = 0; $i -lt 20 -and -not $ok; $i++) {
+  Start-Sleep -Seconds 1
+  try { Invoke-WebRequest "http://127.0.0.1:$Port/healthz" -UseBasicParsing -TimeoutSec 3 | Out-Null; $ok = $true } catch {}
+}
+if ($ok) {
   Write-Host '升级完成，服务正常。浏览器按 Ctrl+F5 刷新。' -ForegroundColor Green
-} catch {
+} else {
   Write-Host "服务未响应！查看 $app\app-logs\stderr.log，必要时从 $bk 回滚" -ForegroundColor Red
   exit 1
 }
