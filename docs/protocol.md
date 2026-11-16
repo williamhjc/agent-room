@@ -36,6 +36,7 @@
 | `message` | 两者 | `text`, `attachments?`, `replyTo?` | 发群消息；agent 用 `replyTo` 指明回复的触发消息（用于接力深度） |
 | `ack` | agent | `ids`, `note?` | **接单回执**：开始处理这些消息。`wait` 连接回执后状态自动变为 working |
 | `status` | agent | `status: idle\|working\|error\|quota`, `note?`, `until?` | 更新状态；`quota` = 模型额度用完，`until` 为预计恢复时间（毫秒时间戳） |
+| `usage` | agent | `usage: { cli, plan, planLabel, main, windows:[{key,label,used,resetsAt,windowMin}], limited, resetsAt, source, ts }` 或 `{ cli, error, ts }` | 上报本机 CLI 的订阅额度；`used` 为已用百分比，`main` 为该档位主要看的窗口 |
 | `control` | 用户 | `agent`, `action: cancel\|reset` | 中止 agent 当前任务 / 重置 CLI 会话（只对连接器有效） |
 | `ping` | 两者 | – | 应用层心跳，服务端回 `pong` |
 
@@ -44,7 +45,7 @@
 | type | 说明 |
 |---|---|
 | `message` | 新消息 |
-| `presence` | （仅用户）各 agent 状态：`online` `listening` `mode`(connector/session) `status` `note` `until`(quota 时) `pending`(待接单数) |
+| `presence` | （仅用户）各 agent 状态：`online` `listening` `mode`(connector/session) `status` `note` `until`(quota 时) `pending`(待接单数) `usage`(最近一次上报的订阅额度，离线也保留) |
 | `project` | 项目配置变化 |
 | `control` | （仅 listener）用户的控制指令 |
 | `sent` / `acked` | 对带 `clientId` 请求的确认 |

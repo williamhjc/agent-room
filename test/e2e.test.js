@@ -213,7 +213,8 @@ test('附件：伪造的附件 URL 会被丢弃，HTML 等类型强制下载', a
 test('额度识别：解析各家 CLI 的恢复时间', async () => {
   const { detectLimit } = await import('../agent/common.js');
   const now = Date.now();
-  assert.equal(detectLimit('Claude AI usage limit reached|1794560400', now).until, 1794560400000);
+  const resetSec = Math.floor(now / 1000) + 3 * 3600;
+  assert.equal(detectLimit(`Claude AI usage limit reached|${resetSec}`, now).until, resetSec * 1000);
   const inX = detectLimit("You've hit your usage limit. Try again in 2 days 3 hours 5 minutes.", now);
   assert.equal(inX.until - now, ((2 * 24 + 3) * 60 + 5) * 60_000);
   const at = detectLimit("You've hit your usage limit. Upgrade to Pro or try again at 9:41 PM.", now);
@@ -258,6 +259,40 @@ test('额度用完：连接器在群里说明并通知派活的 agent，消息�
   assert.match(done.text, /注册/);
   await waitFor(() => user.presence.find((a) => a.name === 'Alice' && a.status === 'idle'));
   assert.ok(!user.msgs.find((m) => m.meta?.kind === 'ack-timeout' && m.text.includes('@Alice')), '额度等待期间不应报 Alice 超时');
+  user.ws.close();
+});
+
+test('订阅额度：上报到成员状态；官方恢复时间很远但额度接口显示已恢复时提前重试', async () => {
+  const { project, tok } = await newProject([
+    { name: 'Alice', type: 'claude', role: '开发' },
+    { name: 'Bob', type: 'codex', role: '架构' },
+  ]);
+  const user = await userClient(project.id);
+  const okUsage = JSON.stringify({ plan: 'max20x', planLabel: 'Max 20x', main: 'week', windows: [{ key: '5h', used: 10, windowMin: 300 }, { key: 'week', used: 40, windowMin: 10080, resetsAt: Date.now() + 86400e3 }] });
+  start(['agent/connector.js', '--server', WSURL, '--project', project.id, '--agent', 'Alice', '--token', tok.Alice, '--workdir', path.join(tmp, 'wd3'), '--dry-run', '--limit-retry', '0.05'], {
+    AGENT_ROOM_FAKE_USAGE: okUsage,
+  });
+  const alice = await waitFor(() => user.presence.find((a) => a.name === 'Alice' && a.online && a.usage));
+  assert.equal(alice.usage.planLabel, 'Max 20x');
+  assert.equal(alice.usage.main, 'week');
+  assert.equal(alice.usage.windows.length, 2);
+  assert.equal(alice.usage.limited, false);
+
+  // 碰到额度上限，错误信息说 2 小时后恢复；但额度接口说有余量 → 不干等，几秒内提前重试成功
+  user.say('@Alice [模拟额度用完:7200] 实现登录接口');
+  await waitFor(() => user.msgs.find((m) => m.from === 'Alice' && m.meta?.kind === 'quota'));
+  const done = await waitFor(() => user.msgs.find((m) => m.from === 'Alice' && /额度已恢复/.test(m.text)), 15000);
+  assert.match(done.text, /实现登录接口/);
+  await waitFor(() => user.presence.find((a) => a.name === 'Alice' && a.status === 'idle'));
+
+  // 会话模式：room usage 查询并同步到网页（这里用假数据：Pro 周额度用完）
+  const fullUsage = JSON.stringify({ plan: 'pro', planLabel: 'Pro', main: 'week', windows: [{ used: 5, windowMin: 300 }, { used: 100, windowMin: 10080, resetsAt: Date.now() + 2 * 86400e3 }] });
+  const p = start(['agent/room.js', 'usage'], { ...roomEnv(project, 'Bob', tok.Bob), AGENT_ROOM_FAKE_USAGE: fullUsage });
+  assert.equal(await exited(p), 0);
+  assert.match(p.out, /Codex 订阅：Pro/);
+  assert.match(p.out, /★ 每周：已用 100%/);
+  const bob = await waitFor(() => user.presence.find((a) => a.name === 'Bob' && a.usage?.limited));
+  assert.ok(bob.usage.resetsAt > Date.now());
   user.ws.close();
 });
 

@@ -1,6 +1,7 @@
 // Agent Room 网页端
-import { headIcon, sceneSVG, sceneState, sceneCaption } from './scenes.js';
+import { headIcon, sceneSVG, sceneState, sceneCaption, untilText } from './scenes.js';
 const $ = (s) => document.querySelector(s);
+const TOUCH = matchMedia('(pointer: coarse)').matches;
 const esc = (s) =>
   String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
 const ls = {
@@ -438,6 +439,7 @@ function renderMembers() {
               <div class="member-status"></div>
             </div>
           </div>
+          <div class="member-usage"></div>
           <div class="member-role">${esc(a.role || '（未定义分工）')}</div>
           <div class="member-actions"></div>
         </div>`;
@@ -463,6 +465,9 @@ function renderMembers() {
       st.mode ? `<span class="mode-tag">${MODE_TEXT[st.mode] || st.mode}</span>` : ''
     }${st.pending ? `<span class="pend" title="已派发但还没接单的消息">${st.status === 'working' ? '排队' : '待接单'} ${st.pending}</span>` : ''}`;
     el.querySelector('.member-status').textContent = `${statusText(st)}${st.host ? ` · ${st.host}` : ''}`;
+    const ub = el.querySelector('.member-usage');
+    const uh = usageHTML(st.usage);
+    if (ub.dataset.html !== uh) ub.innerHTML = ub.dataset.html = uh;
     el.querySelector('.member-actions').innerHTML = `
       <button class="btn xs" data-act="at" data-name="${esc(a.name)}">@它</button>
       <button class="btn xs" data-act="connect" data-name="${esc(a.name)}">接入方式</button>
@@ -470,9 +475,56 @@ function renderMembers() {
       ${st.mode === 'connector' && st.listening ? `<button class="btn xs" data-act="reset" data-name="${esc(a.name)}" title="清空该 agent 的 CLI 会话上下文">重置会话</button>` : ''}`;
   }
 }
+// ---------- 订阅额度 ----------
+function relTime(t) {
+  const diff = t - Date.now();
+  if (diff <= 0 && diff > -60_000) return '刚刚';
+  const min = Math.round(diff / 60_000);
+  const a = Math.abs(min);
+  const s = a < 1 ? '不到 1 分钟' :a < 60 ? `${a} 分钟` : a < 2880 ? `${Math.floor(a / 60)} 小时${a % 60 && a < 600 ? ` ${a % 60} 分` : ''}` : `${Math.round(a / 1440)} 天`;
+  return min >= 0 ? `${s}后` : `${s}前`;
+}
+function clockText(t) {
+  const d = new Date(t);
+  const hm = d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false });
+  return d.toDateString() === new Date().toDateString() ? hm : `${d.getMonth() + 1}/${d.getDate()} ${hm}`;
+}
+function usageHTML(u) {
+  if (!u) return '';
+  const stale = Date.now() - u.ts > 30 * 60_000;
+  if (u.error) return `<div class="usage-err" title="${esc(u.error)}">额度：查询失败 · ${esc(u.error.slice(0, 60))}</div>`;
+  const wins = [...(u.windows || [])].sort((a, b) => (b.key === u.main) - (a.key === u.main));
+  if (!wins.length) return '';
+  const rows = wins
+    .map((w) => {
+      // 本地数据可能过期：重置时间已过就当作已清零
+      const used = w.resetsAt && w.resetsAt < Date.now() ? 0 : w.used;
+      const left = Math.max(0, Math.round(100 - used));
+      const lv = left <= 0 ? 'empty' : left < 20 ? 'low' : left < 50 ? 'mid' : 'ok';
+      const main = w.key === u.main;
+      const reset = w.resetsAt ? `${clockText(w.resetsAt)} 重置（${relTime(w.resetsAt)}）` : '';
+      return `<div class="u-row ${main ? 'main' : ''} lv-${lv}" title="${esc(w.label)}窗口：已用 ${Math.round(used)}%${reset ? '，' + reset : ''}">
+        <span class="u-label">${main ? '★ ' : ''}${esc(w.label)}</span>
+        <span class="u-bar"><i style="width:${left}%"></i></span>
+        <span class="u-num">剩 ${left}%</span>
+        ${main || left < 50 ? `<span class="u-reset">${reset}</span>` : ''}
+      </div>`;
+    })
+    .join('');
+  const src = u.source === 'sessions' ? `来自 ${relTime(u.asOf || u.ts)}的会话记录` : `${relTime(u.ts)}更新`;
+  return `<div class="usage ${stale ? 'stale' : ''} ${u.limited ? 'limited' : ''}">
+    <div class="u-head"><span class="u-plan">${u.cli === 'codex' ? 'Codex' : 'Claude'} ${esc(u.planLabel || '')}</span>${u.limited ? `<span class="u-flag">已用完${u.resetsAt ? ' · ' + relTime(u.resetsAt) + '恢复' : ''}</span>` : ''}<span class="u-src">${src}</span></div>
+    ${rows}
+    ${u.note ? `<div class="u-note">${esc(u.note)}</div>` : ''}
+  </div>`;
+}
+
 function statusText(st) {
-  if (st.status === 'idle' && st.mode === 'session') return st.listening ? '在线 · 等待消息' : '未在监听';
-  return STATUS_TEXT[st.status] || st.status;
+  let t = st.status === 'idle' && st.mode === 'session' ? (st.listening ? '在线 · 等待消息' : '未在监听') : STATUS_TEXT[st.status] || st.status;
+  if (st.status === 'quota' && st.until) t = `额度用完 · ${untilText(st.until)}`;
+  // 会话模式自己发现不了额度用完，用额度接口的结果补一句
+  else if (st.usage?.limited && !st.usage.error && Date.now() - st.usage.ts < 30 * 60_000) t += ' · 订阅额度已用完';
+  return t;
 }
 $('#memberList').addEventListener('click', (e) => {
   const b = e.target.closest('button[data-act]');
@@ -689,12 +741,18 @@ input.addEventListener('keydown', (e) => {
     }
     if (e.key === 'Escape') return closePop();
   }
-  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && !(TOUCH && !e.metaKey && !e.ctrlKey)) {
     e.preventDefault();
     sendMsg();
   }
 });
 $('#btnSend').onclick = sendMsg;
+if (TOUCH) {
+  input.placeholder = '输入消息，@成员 派发任务';
+  input.setAttribute('enterkeyhint', 'enter');
+}
+// 发送后保持键盘不收起（iOS 点按钮会让输入框失焦）
+$('#btnSend').addEventListener('pointerdown', (e) => TOUCH && document.activeElement === input && e.preventDefault());
 function sendMsg() {
   const text = input.value.trim();
   if (S.attachments.some((a) => a.uploading)) return toast('附件还在上传…');
@@ -933,9 +991,37 @@ $('#btnPause').onclick = async () => {
 };
 
 // ---------- 移动端 ----------
+function syncScrim() {
+  $('#scrim').classList.toggle('show', $('#sidebar').classList.contains('open') || $('#members').classList.contains('open'));
+}
+new MutationObserver(syncScrim).observe($('#sidebar'), { attributes: true, attributeFilter: ['class'] });
+new MutationObserver(syncScrim).observe($('#members'), { attributes: true, attributeFilter: ['class'] });
 $('#btnMenu').onclick = () => $('#sidebar').classList.toggle('open');
 $('#btnMembers').onclick = () => $('#members').classList.add('open');
 $('#btnCloseMembers').onclick = () => $('#members').classList.remove('open');
+$('#scrim').onclick = () => {
+  $('#sidebar').classList.remove('open');
+  $('#members').classList.remove('open');
+};
+// iOS Safari：100vh 含地址栏、弹出键盘时页面不缩小还会整体上推。按 visualViewport 实际可见区域布局，输入框始终贴在键盘上方
+(() => {
+  const vv = window.visualViewport;
+  if (!vv) return;
+  const root = document.documentElement.style;
+  let raf = 0;
+  const fit = () => {
+    raf = 0;
+    if (Math.abs(vv.scale - 1) > 0.01) return; // 用户双指缩放时不跟随
+    const stick = !$('#messages').classList.contains('hidden') && isAtBottom();
+    root.setProperty('--app-h', `${Math.round(vv.height)}px`);
+    root.setProperty('--app-top', `${Math.max(0, Math.round(vv.offsetTop))}px`);
+    if (stick) scrollBottom();
+  };
+  const req = () => raf || (raf = requestAnimationFrame(fit));
+  vv.addEventListener('resize', req);
+  vv.addEventListener('scroll', req);
+  fit();
+})();
 
 // ---------- 启动 ----------
 async function boot() {
@@ -953,5 +1039,5 @@ async function boot() {
 window.addEventListener('hashchange', route);
 setInterval(() => S.current || loadProjects().catch(() => {}), 15000);
 // 额度恢复倒计时
-setInterval(() => S.current && S.presence?.some((a) => a.status === 'quota') && renderMembers(), 30000);
+setInterval(() => S.current && S.presence?.some((a) => a.status === 'quota' || a.usage) && renderMembers(), 30000);
 boot();

@@ -2,6 +2,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { execFileSync } from 'node:child_process';
 
 let WSImpl = globalThis.WebSocket;
 if (!WSImpl) {
@@ -291,4 +292,243 @@ export function parseReset(text, now = Date.now()) {
     if (h < 24 && min < 60 && (ap || m[2])) return nextWallClock(h, min, m[4], now);
   }
   return null;
+}
+
+// ---------- 订阅额度查询 ----------
+// 先认订阅级别（决定看哪个窗口），再查当前窗口的用量。只读本机 CLI 的登录信息，不刷新令牌、不上传令牌。
+// Codex：~/.codex/auth.json（或 $CODEX_HOME）→ chatgpt.com/backend-api/wham/usage；失败时读最近会话日志里的 rate_limits
+// Claude：~/.claude/.credentials.json（macOS 为钥匙串 "Claude Code-credentials"）→ api.anthropic.com/api/oauth/usage
+const readJsonFile = (f) => {
+  try {
+    return JSON.parse(fs.readFileSync(f, 'utf8'));
+  } catch {
+    return null;
+  }
+};
+function jwtPayload(t) {
+  try {
+    return JSON.parse(Buffer.from(String(t).split('.')[1], 'base64url').toString('utf8'));
+  } catch {
+    return null;
+  }
+}
+async function getJson(url, headers) {
+  const res = await fetch(url, { headers: { Accept: 'application/json', ...headers }, signal: AbortSignal.timeout(15000) });
+  const text = await res.text();
+  if (!res.ok) throw new Error(`HTTP ${res.status}${text ? '：' + text.replace(/\s+/g, ' ').slice(0, 160) : ''}`);
+  return JSON.parse(text);
+}
+const PLAN_LABEL = { free: 'Free', plus: 'Plus', pro: 'Pro', team: 'Team', business: 'Business', enterprise: 'Enterprise', edu: 'Edu', max: 'Max' };
+const planLabel = (p) => PLAN_LABEL[p] || (p ? p[0].toUpperCase() + p.slice(1) : '未知');
+/** 窗口归类：≤6 小时算 5 小时窗口，≥6 天算周窗口 */
+function mkWindow({ key, label, used, resetsAt, windowMin }) {
+  const w = { key, label, used: Math.max(0, Math.min(100, Number(used) || 0)), resetsAt: resetsAt || null, windowMin: windowMin || null };
+  if (!w.key) w.key = windowMin && windowMin <= 360 ? '5h' : windowMin && windowMin >= 8640 ? 'week' : `w${windowMin || 0}`;
+  if (!w.label) w.label = w.key === '5h' ? '5 小时' : w.key === 'week' ? '每周' : windowMin ? `${Math.round(windowMin / 60)} 小时` : '窗口';
+  // 本地缓存的数据可能是旧的：重置时间已过就当作已清零
+  if (w.resetsAt && w.resetsAt < Date.now()) w.used = 0;
+  return w;
+}
+function finishUsage(u) {
+  u.windows = (u.windows || []).filter(Boolean);
+  if (!u.windows.some((w) => w.key === u.main)) u.main = u.windows[0]?.key || u.main;
+  const full = u.windows.filter((w) => w.used >= 100);
+  u.limited = !!u.limitReached || full.length > 0;
+  // 用完时什么时候能恢复：所有用满窗口里最晚的重置时间
+  u.resetsAt = full.length ? Math.max(...full.map((w) => w.resetsAt || 0)) || null : null;
+  delete u.limitReached;
+  return u;
+}
+
+function codexHome() {
+  return process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
+}
+async function codexUsage() {
+  const auth = readJsonFile(path.join(codexHome(), 'auth.json'));
+  const tok = auth?.tokens;
+  const claims = jwtPayload(tok?.id_token)?.['https://api.openai.com/auth'] || jwtPayload(tok?.access_token)?.['https://api.openai.com/auth'] || {};
+  let plan = String(claims.chatgpt_plan_type || '').toLowerCase();
+  const u = { cli: 'codex', plan, windows: [], source: '' };
+  let apiErr = null;
+  if (tok?.access_token) {
+    try {
+      const accountId = tok.account_id || claims.chatgpt_account_id;
+      const d = await getJson('https://chatgpt.com/backend-api/wham/usage', {
+        Authorization: `Bearer ${tok.access_token}`,
+        ...(accountId ? { 'ChatGPT-Account-Id': accountId } : {}),
+        'User-Agent': 'codex_cli_rs',
+      });
+      plan = String(d.plan_type || plan).toLowerCase();
+      const rl = d.rate_limit || {};
+      const conv = (w) =>
+        w &&
+        mkWindow({
+          used: w.used_percent,
+          windowMin: w.limit_window_seconds ? Math.round(w.limit_window_seconds / 60) : null,
+          resetsAt: w.reset_at ? w.reset_at * 1000 : w.reset_after_seconds != null ? Date.now() + w.reset_after_seconds * 1000 : null,
+        });
+      u.windows = [conv(rl.primary_window), conv(rl.secondary_window)];
+      u.limitReached = rl.limit_reached === true || rl.allowed === false;
+      u.source = 'api';
+    } catch (e) {
+      apiErr = e;
+    }
+  } else if (auth?.OPENAI_API_KEY) {
+    throw new Error('Codex 用的是 API Key 登录，没有订阅额度窗口');
+  }
+  if (!u.source) {
+    // 退路：Codex 每次请求后会把 rate_limits 写进会话日志
+    const r = codexRateLimitsFromSessions();
+    if (!r) throw apiErr || new Error(`没找到 Codex 登录信息（${path.join(codexHome(), 'auth.json')}）`);
+    const conv = (w) =>
+      w &&
+      mkWindow({
+        used: w.used_percent,
+        windowMin: w.window_minutes,
+        resetsAt: w.resets_at ? w.resets_at * 1000 : w.resets_in_seconds != null ? r.ts + w.resets_in_seconds * 1000 : null,
+      });
+    u.windows = [conv(r.limits.primary), conv(r.limits.secondary)];
+    u.source = 'sessions';
+    u.asOf = r.ts;
+    if (apiErr) u.note = `接口查询失败（${apiErr.message.slice(0, 80)}），显示的是最近一次会话记录`;
+  }
+  u.plan = plan;
+  u.planLabel = planLabel(plan);
+  // Pro 的 5 小时窗口很宽裕，真正卡人的是周额度；Plus 等其他档位先撞 5 小时窗口
+  u.main = plan === 'pro' ? 'week' : '5h';
+  return finishUsage(u);
+}
+function codexRateLimitsFromSessions() {
+  const root = path.join(codexHome(), 'sessions');
+  const files = [];
+  const walk = (dir, depth) => {
+    let ents;
+    try {
+      ents = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    // 目录按 年/月/日 命名，倒序只看最近的几个
+    ents.sort((a, b) => b.name.localeCompare(a.name));
+    for (const e of ents) {
+      if (files.length >= 8) return;
+      const p = path.join(dir, e.name);
+      if (e.isDirectory() && depth < 3) walk(p, depth + 1);
+      else if (e.isFile() && e.name.endsWith('.jsonl')) files.push(p);
+    }
+  };
+  walk(root, 0);
+  const mtime = (f) => {
+    try {
+      return fs.statSync(f).mtimeMs;
+    } catch {
+      return 0;
+    }
+  };
+  files.sort((a, b) => mtime(b) - mtime(a));
+  for (const f of files) {
+    let text;
+    try {
+      const size = fs.statSync(f).size;
+      const len = Math.min(size, 2_000_000);
+      const fd = fs.openSync(f, 'r');
+      const buf = Buffer.alloc(len);
+      fs.readSync(fd, buf, 0, len, size - len);
+      fs.closeSync(fd);
+      text = buf.toString('utf8');
+    } catch {
+      continue;
+    }
+    const lines = text.split('\n');
+    for (let i = lines.length - 1; i >= 0; i--) {
+      if (!lines[i].includes('rate_limits')) continue;
+      try {
+        const o = JSON.parse(lines[i]);
+        const limits = o.payload?.rate_limits || o.rate_limits || o.msg?.rate_limits;
+        if (limits && (limits.primary || limits.secondary)) return { limits, ts: Date.parse(o.timestamp) || mtime(f) };
+      } catch {}
+    }
+  }
+  return null;
+}
+
+function readClaudeCreds() {
+  const dir = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude');
+  let c = readJsonFile(path.join(dir, '.credentials.json'))?.claudeAiOauth;
+  if (!c && process.platform === 'darwin') {
+    try {
+      const raw = execFileSync('security', ['find-generic-password', '-s', 'Claude Code-credentials', '-w'], {
+        encoding: 'utf8',
+        timeout: 5000,
+        stdio: ['ignore', 'pipe', 'ignore'],
+      });
+      c = JSON.parse(raw.trim())?.claudeAiOauth;
+    } catch {}
+  }
+  return c || null;
+}
+async function claudeUsage() {
+  const c = readClaudeCreds();
+  if (!c?.accessToken) throw new Error('没找到 Claude Code 的订阅登录信息（API Key 方式没有订阅额度窗口）');
+  const sub = String(c.subscriptionType || '').toLowerCase();
+  const mult = String(c.rateLimitTier || '').match(/(\d+)x/)?.[1];
+  const u = { cli: 'claude', plan: sub + (mult ? mult + 'x' : ''), planLabel: planLabel(sub) + (mult ? ` ${mult}x` : ''), windows: [], source: 'api' };
+  // Max 档的 5 小时窗口很宽，先撞的是周额度；Pro 先撞 5 小时
+  u.main = sub === 'max' ? 'week' : '5h';
+  if (c.expiresAt && c.expiresAt < Date.now()) throw new Error('Claude 登录令牌已过期，Claude CLI 下次运行时会自动刷新');
+  const d = await getJson('https://api.anthropic.com/api/oauth/usage', {
+    Authorization: `Bearer ${c.accessToken}`,
+    'anthropic-beta': 'oauth-2025-04-20',
+    'User-Agent': 'agent-room',
+  });
+  const conv = (w, key, label, windowMin) =>
+    w && w.utilization != null && mkWindow({ key, label, windowMin, used: w.utilization, resetsAt: w.resets_at ? Date.parse(w.resets_at) : null });
+  u.windows = [
+    conv(d.five_hour, '5h', '5 小时', 300),
+    conv(d.seven_day, 'week', '每周', 10080),
+    conv(d.seven_day_opus, 'week-opus', '每周 · Opus', 10080),
+    conv(d.seven_day_sonnet, 'week-sonnet', '每周 · Sonnet', 10080),
+  ];
+  return finishUsage(u);
+}
+
+/**
+ * 查询本机某个 CLI 的订阅额度。不会抛错：失败时返回 { cli, error }。
+ * 返回 { cli, plan, planLabel, main, windows:[{key,label,used,resetsAt,windowMin}], limited, resetsAt, source, ts }
+ * 测试用：环境变量 AGENT_ROOM_FAKE_USAGE 为 JSON 时直接用它
+ */
+export async function fetchUsage(cli) {
+  const ts = Date.now();
+  try {
+    if (process.env.AGENT_ROOM_FAKE_USAGE) {
+      const f = JSON.parse(process.env.AGENT_ROOM_FAKE_USAGE);
+      return { ...finishUsage({ cli, source: 'fake', ...f, windows: (f.windows || []).map(mkWindow) }), ts };
+    }
+    const u = cli === 'codex' ? await codexUsage() : cli === 'claude' ? await claudeUsage() : null;
+    if (!u) return { cli, error: `不支持查询 ${cli} 的额度`, ts };
+    return { ...u, ts };
+  } catch (e) {
+    return { cli, error: String(e.message || e).slice(0, 200), ts };
+  }
+}
+
+/** 多行文字描述（命令行 / 日志用） */
+export function fmtUsage(u) {
+  if (!u) return '（无额度信息）';
+  if (u.error) return `额度查询失败：${u.error}`;
+  const left = (t) => {
+    const min = Math.max(0, Math.round((t - Date.now()) / 60000));
+    return min < 60 ? `${min} 分钟后重置` : min < 2880 ? `${Math.floor(min / 60)} 小时 ${min % 60} 分后重置` : `${Math.round(min / 1440)} 天后重置`;
+  };
+  const name = u.cli === 'codex' ? 'Codex' : 'Claude';
+  return [
+    `${name} 订阅：${u.planLabel || '未知'}（★ 为该档位主要看的窗口${u.source === 'sessions' ? '；数据来自最近一次会话记录' : ''}）`,
+    ...u.windows.map(
+      (w) => `${w.key === u.main ? '★' : '  '} ${w.label}：已用 ${Math.round(w.used)}%，剩余 ${Math.round(100 - w.used)}%${w.resetsAt ? '，' + left(w.resetsAt) : ''}`
+    ),
+    u.note || '',
+    u.limited ? `⚠️ 额度已用完${u.resetsAt ? '，' + left(u.resetsAt) : ''}` : '',
+  ]
+    .filter(Boolean)
+    .join('\n');
 }

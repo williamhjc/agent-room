@@ -2,7 +2,13 @@
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#070b16" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="Agent Room" />
+  <meta name="format-detection" content="telephone=no" />
   <title>Agent Room</title>
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%235b5bd6'/><text x='16' y='22' font-size='16' text-anchor='middle' fill='white' font-family='sans-serif'>@</text></svg>" />
   <link rel="stylesheet" href="/style.css" />
@@ -66,11 +72,13 @@
           <div class="mention-pop hidden" id="mentionPop"></div>
           <button class="icon-btn attach-btn" id="btnAttach" title="添加图片/文件（也可直接粘贴或拖拽）">📎</button>
           <input type="file" id="fileInput" multiple hidden />
-          <textarea id="input" rows="1" placeholder="输入消息，@成员 派发任务（Enter 发送，Shift+Enter 换行）"></textarea>
+          <textarea id="input" rows="1" enterkeyhint="send" placeholder="输入消息，@成员 派发任务（Enter 发送，Shift+Enter 换行）"></textarea>
           <button class="btn primary" id="btnSend">发送</button>
         </div>
       </footer>
     </main>
+
+    <div class="scrim" id="scrim"></div>
 
     <!-- 右侧：成员 -->
     <aside class="members hidden" id="members">

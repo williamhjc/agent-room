@@ -9,14 +9,15 @@
 //   node room.js history [-n 20]          最近的群聊记录
 //   node room.js status working|idle [说明]
 //   node room.js who                      成员与在线状态
+//   node room.js usage [--json]           查看本机 Claude/Codex 订阅额度（并同步到网页）
 //   node room.js get <附件URL> [-o 文件]  下载附件
 import fs from 'node:fs';
 import path from 'node:path';
-import { parseArgs, loadConn, connectAgent, readState, updateState, fmtMessage, httpBase, uploadFile } from './common.js';
+import { parseArgs, loadConn, connectAgent, readState, updateState, fmtMessage, httpBase, uploadFile, fetchUsage, fmtUsage } from './common.js';
 
 const argv = process.argv.slice(2);
 const cmd = argv[0] && !argv[0].startsWith('--') ? argv.shift() : 'help';
-const args = parseArgs(argv, ['attach'], [], ['review', 'done', 'peek', 'stdin']);
+const args = parseArgs(argv, ['attach'], [], ['review', 'done', 'peek', 'stdin', 'json']);
 const conn = loadConn(args);
 const base = conn.server ? httpBase(conn.server) : '';
 const out = (s = '') => process.stdout.write(s + '\n');
@@ -31,6 +32,16 @@ function need() {
   }
 }
 const isForMe = (m) => m.from !== conn.agent && Array.isArray(m.dispatch) && m.dispatch.includes(conn.agent);
+/** 查本机订阅额度并上报（会话模式靠 room wait 顺带上报，5 分钟最多一次） */
+async function reportUsage(c, force = false) {
+  const type = args.cli || c.welcome.self?.type;
+  if (!['claude', 'codex'].includes(type)) return null;
+  if (!force && Date.now() - (readState(conn).usageAt || 0) < 5 * 60_000) return null;
+  updateState(conn, { usageAt: Date.now() });
+  const u = await fetchUsage(type);
+  await c.request({ type: 'usage', usage: u }).catch(() => {});
+  return u;
+}
 const show = (m, full = false) => out(fmtMessage(m, { base, me: conn.agent, maxLen: full ? 0 : 3000 }) + '\n');
 
 async function readStdin() {
@@ -103,6 +114,7 @@ const commands = {
       },
       onClose: (ev) => resolveClosed(ev.code === 4009 ? 'replaced' : 'closed'),
     });
+    reportUsage(c).catch(() => {});
     const pendingIds = new Set(c.welcome.pending || []);
     const hist = c.welcome.history;
     // 首次使用（无游标）只取未接单的派发 + 少量上下文，避免把整段历史当新消息
@@ -216,6 +228,15 @@ const commands = {
     }
   },
 
+  async usage() {
+    need();
+    const c = await connectAgent(conn, { mode: 'tool', historyLimit: 1 });
+    const u = await reportUsage(c, true);
+    c.close();
+    if (!u) die(`不知道 @${conn.agent} 用的是哪个 CLI，请加 --cli claude 或 --cli codex`);
+    out(args.json ? JSON.stringify(u, null, 2) : fmtUsage(u));
+  },
+
   async get() {
     const u = args._[0];
     if (!u) die('用法：room get <附件URL或/files/路径> [-o 文件]');
@@ -227,8 +248,10 @@ const commands = {
     out(`已保存到 ${file}`);
   },
 
-  help() {
-    out(fs.readFileSync(new URL(import.meta.url), 'utf8').split('\n').slice(1, 15).map((l) => l.replace(/^\/\/ ?/, '')).join('\n'));
+  async help() {
+    const lines = fs.readFileSync(new URL(import.meta.url), 'utf8').split('\n').slice(1);
+    const end = lines.findIndex((l) => !l.startsWith('//'));
+    out(lines.slice(0, end).map((l) => l.replace(/^\/\/ ?/, '')).join('\n'));
   },
 };
 

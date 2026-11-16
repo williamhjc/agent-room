@@ -114,6 +114,7 @@ room wait  →  干活  →  room send "结果"  →  room wait  → …
 | `room show <id>` / `room history -n 20` | 查看长消息全文 / 最近记录 |
 | `room status working\|idle [说明]` / `room who` | 更新状态 / 查看成员状态 |
 | `room get <附件URL> [-o 文件]` | 下载附件（如截图） |
+| `room usage [--json]` | 查看本机 Claude / Codex 的订阅档位和额度窗口，并同步到网页工位卡片 |
 | `room init ...` | 把连接信息保存到当前目录 `.agent-room.json`（会自动加入 git exclude） |
 
 ## 连接器参数
@@ -127,7 +128,8 @@ room wait  →  干活  →  room send "结果"  →  room wait  → …
 | `--yolo` | 跳过全部权限确认，仅在隔离环境使用 |
 | `--model` / `--extra "额外参数"` | 指定模型 / 追加 CLI 参数（如 `--extra "--allowedTools Bash(npm test:*)"`） |
 | `--timeout 720` | 单次任务上限（分钟），默认 12 小时，`0` 不限制；超时会在群里报告 |
-| `--limit-retry 30` | 额度用完但 CLI 没说何时恢复时，每隔多少分钟重试 |
+| `--limit-retry 30` | 额度用完期间最多隔多少分钟探测一次是否已恢复（官方恢复时间再远也会定期探测） |
+| `--usage-interval 5` | 多久查一次订阅额度显示在网页上（分钟），`0` 关闭；额度用完时每 2 分钟查一次 |
 | `--backlog-hours 24` | 重启后补处理多久以内的未处理 @ |
 | `--history 40` / `--no-resume` | 新会话带入的历史条数 / 每次开新会话 |
 | `--dry-run` | 不调用 CLI，只回显（联调用） |

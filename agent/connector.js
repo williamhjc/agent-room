@@ -5,14 +5,14 @@
 // 用法：
 //   node agent/connector.js --server ws://HOST:8787/ws --project <ID> --agent <名称> --token <TOKEN> \
 //        [--workdir 路径] [--cli claude|codex] [--bin 可执行文件] [--permission 模式] [--yolo] \
-//        [--model 模型] [--extra "额外参数"] [--timeout 分钟，默认 720] [--limit-retry 分钟] [--history 条数]
+//        [--model 模型] [--extra "额外参数"] [--timeout 分钟，默认 720] [--limit-retry 分钟] [--usage-interval 分钟，默认 5，0 关闭] [--history 条数]
 // 连接信息也可以来自环境变量 AGENT_ROOM_* 或当前目录的 .agent-room.json（room init 生成）。
 import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { WS, parseArgs, loadConn, httpBase, stateDir, readState, updateState, fmtMessage, ensureRoomShim, detectLimit, looksLikeLimitResult } from './common.js';
+import { WS, parseArgs, loadConn, httpBase, stateDir, readState, updateState, fmtMessage, ensureRoomShim, detectLimit, looksLikeLimitResult, fetchUsage, fmtUsage } from './common.js';
 
 const ROOM_TOOL = path.join(path.dirname(fileURLToPath(import.meta.url)), 'room.js');
 const SHIM_DIR = ensureRoomShim(ROOM_TOOL); // 提供 `room` 短命令给 CLI 子进程
@@ -34,6 +34,8 @@ const cfg = {
   // 单次任务上限（分钟）。默认 12 小时，只用来兜底卡死的进程；0 为不限制
   timeoutMin: parseFloat(args.timeout ?? env.AGENT_ROOM_TIMEOUT ?? '720'),
   limitRetryMin: parseFloat(args['limit-retry'] || env.AGENT_ROOM_LIMIT_RETRY || '30'), // 额度用完但不知道何时恢复时，多久重试一次
+  // 多久查一次订阅额度（分钟），显示在网页上；额度用完时每 2 分钟查一次，发现恢复就提前重试
+  usageMin: parseFloat(args['usage-interval'] ?? env.AGENT_ROOM_USAGE_INTERVAL ?? '5'),
   backlogHours: parseFloat(args['backlog-hours'] || env.AGENT_ROOM_BACKLOG_HOURS || '24'),
   historyN: parseInt(args.history || env.AGENT_ROOM_HISTORY || '40', 10),
   noResume: !!args['no-resume'],
@@ -151,6 +153,9 @@ function onServer(data) {
         scheduleLimitRetry();
       }
       setStatus(running ? 'working' : 'idle');
+      // 重连后把额度信息重新报给服务端（太旧就重新查）
+      if (lastUsage && Date.now() - lastUsage.ts < 10 * 60_000) send({ type: 'usage', usage: lastUsage });
+      else refreshUsage();
       pump();
       return;
     }
@@ -236,6 +241,7 @@ async function pump() {
   setStatus('working', runNote);
   const prompt = buildPrompt(triggers);
   const runStart = Date.now();
+  if (state.limited) limitLastTry = runStart;
   saveState({ lastTrigger: last.id, lastRunStart: runStart, seenTs: history.at(-1)?.ts || last.ts });
   let reply;
   try {
@@ -266,6 +272,7 @@ async function pump() {
   running = null;
   currentTriggers = [];
   setStatus('idle');
+  refreshUsage();
   setImmediate(pump);
 }
 
@@ -298,12 +305,14 @@ function enterLimit(info, triggers) {
   saveState({
     limited: { until, guessed: !info.until, reason: info.text, since: state.limited?.since || now, ids, notified: state.limited?.notified || false },
   });
+  limitLastTry = now;
   log(`额度用完 / 限流：${info.text}；${fmtClock(until)} 重试`);
   // 第一次碰到时在群里说一声；之后重试仍失败只更新状态，不刷屏。短暂限流（429/过载）先静默重试一次
   if (first && !info.transient) announceLimit(triggers);
   else if (!first && !state.limited.notified && now - state.limited.since > 10 * 60_000) announceLimit(triggers);
   quotaStatus();
   scheduleLimitRetry();
+  refreshUsage(); // 用额度接口的重置时间校准（错误信息里常常没写什么时候恢复）
 }
 function announceLimit(triggers) {
   const l = state.limited;
@@ -328,25 +337,87 @@ function clearLimit() {
   limitTimer = null;
   saveState({ limited: null });
 }
+/** 没有排队任务时额度恢复了：清掉状态，并在群里说一声（之前通知过大家的话） */
+function recoverIdle(why) {
+  const l = state.limited;
+  if (!l) return;
+  log(`额度已恢复（${why}）`);
+  clearLimit();
+  setStatus('idle');
+  if (l.notified) send({ type: 'message', text: `✅ 我的额度已恢复（${why}），可以继续派活了。`, meta: { kind: 'quota-ok' } });
+}
 function scheduleLimitRetry() {
   clearTimeout(limitTimer);
   if (!state.limited) return;
-  const wait = Math.max(1000, Math.min(state.limited.until - Date.now(), 2 ** 31 - 1));
-  limitTimer = setTimeout(() => {
+  const left = state.limited.until - Date.now();
+  // 官方给的恢复时间可能很远（周额度要等几天），但额度可能提前回来（官方重置、换账号、窗口滚动）。
+  // 所以不管多远，最多每 --limit-retry 分钟探一次：有额度接口先问接口，没有就拿排队任务直接试
+  const probe = cfg.limitRetryMin > 0 ? cfg.limitRetryMin * 60_000 : Infinity;
+  const wait = Math.max(1000, Math.min(left, probe, 2 ** 31 - 1));
+  limitTimer = setTimeout(async () => {
     limitTimer = null;
-    if (!state.limited) return;
-    if (Date.now() < state.limited.until) return scheduleLimitRetry();
-    if (!pending.length && !running) {
-      // 没有等着的任务了，认为已恢复（下次真用到时再判断）
-      log('额度等待期结束，没有排队任务');
-      clearLimit();
-      setStatus('idle');
-      return;
+    if (!state.limited || running) return;
+    if (Date.now() < state.limited.until) {
+      const u = await refreshUsage();
+      if (!state.limited || running) return;
+      if (u && !u.error && u.limited) return scheduleLimitRetry(); // 接口确认还没恢复
+      if (!pending.length) {
+        if (u && !u.error) return recoverIdle('额度接口显示已有余量');
+        return scheduleLimitRetry(); // 没有接口也没有任务，没法验证，等下一次
+      }
+      log(u && !u.error ? '额度接口显示已有余量，提前重试排队的任务' : '提前重试一次排队的任务，看额度是否已恢复');
+      state.limited.until = Date.now();
+      return pump();
     }
+    if (!pending.length) return recoverIdle('等待期已过');
     log('到达预计恢复时间，重试排队的任务');
     pump();
   }, wait);
 }
+
+// ---------- 订阅额度（显示在网页成员卡片上） ----------
+let lastUsage = null;
+let usageBusy = null;
+let limitLastTry = 0;
+function refreshUsage() {
+  if ((cfg.usageMin <= 0 && !state.limited) || (cfg.dryRun && !env.AGENT_ROOM_FAKE_USAGE)) return Promise.resolve(null);
+  if (usageBusy) return usageBusy;
+  usageBusy = (async () => {
+    const u = await fetchUsage(agentCli());
+    const prevErr = lastUsage?.error;
+    lastUsage = u;
+    if (u.error && u.error !== prevErr) log(fmtUsage(u));
+    send({ type: 'usage', usage: u });
+    onUsage(u);
+    return u;
+  })().finally(() => (usageBusy = null));
+  return usageBusy;
+}
+function onUsage(u) {
+  const l = state.limited;
+  if (!l || u.error || running) return;
+  if (u.limited) {
+    // 错误信息里没写恢复时间时，用额度接口给的重置时间
+    if (u.resetsAt && l.guessed && u.resetsAt > Date.now()) {
+      saveState({ limited: { ...l, until: u.resetsAt + 60_000, guessed: false } });
+      quotaStatus();
+      scheduleLimitRetry();
+    }
+    return;
+  }
+  // 接口说有余量了，但 CLI 刚刚还报额度用完：10 分钟内不重复提前重试，避免两边说法不一时来回空转
+  if (isLimited() && Date.now() - limitLastTry > 10 * 60_000) {
+    if (!pending.length) return recoverIdle('额度接口显示已有余量');
+    log('额度接口显示已有余量，提前重试排队的任务');
+    state.limited.until = Date.now();
+    scheduleLimitRetry();
+  }
+}
+setInterval(() => {
+  if (!ws || ws.readyState !== 1 || !project) return;
+  const every = state.limited ? 2 : cfg.usageMin;
+  if (every > 0 && (!lastUsage || Date.now() - lastUsage.ts >= every * 60_000 - 5000)) refreshUsage();
+}, 60_000).unref?.();
 
 const fmt = (m) => fmtMessage(m, { base, me: cfg.agent, maxLen: 3000 });
 

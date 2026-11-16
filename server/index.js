@@ -205,6 +205,7 @@ function presence(projectId) {
       since: st?.since || null,
       host: st?.host || '',
       pending: r.pending.get(a.name)?.size || 0,
+      usage: st?.usage || null, // 订阅额度（离线也保留最后一次，网页标注时间）
     };
   });
 }
@@ -744,6 +745,33 @@ function cleanAttachments(projectId, list) {
     }));
 }
 
+/** 订阅额度上报：只保留展示需要的字段 */
+function cleanUsage(u) {
+  if (!u || typeof u !== 'object') return null;
+  const num = (v) => (Number.isFinite(Number(v)) && v !== null && v !== '' ? Number(v) : null);
+  const str = (v, n = 40) => (v == null ? '' : String(v).slice(0, n));
+  const out = { cli: str(u.cli, 10), ts: num(u.ts) || Date.now() };
+  if (u.error) return { ...out, error: str(u.error, 200) };
+  Object.assign(out, {
+    plan: str(u.plan),
+    planLabel: str(u.planLabel),
+    main: str(u.main, 20),
+    source: str(u.source, 20),
+    note: str(u.note, 200),
+    asOf: num(u.asOf),
+    limited: !!u.limited,
+    resetsAt: num(u.resetsAt),
+    windows: (Array.isArray(u.windows) ? u.windows : []).slice(0, 6).map((w) => ({
+      key: str(w?.key, 20),
+      label: str(w?.label, 30),
+      used: Math.max(0, Math.min(100, num(w?.used) ?? 0)),
+      resetsAt: num(w?.resetsAt),
+      windowMin: num(w?.windowMin),
+    })),
+  });
+  return out;
+}
+
 /** agent 发言可附带的展示标记（白名单） */
 function agentMeta(meta) {
   if (!meta || !['quota', 'quota-ok'].includes(meta.kind)) return undefined;
@@ -781,6 +809,14 @@ function onMessage(ws, data, send) {
     case 'status': {
       if (!st) return;
       setAgentStatus(st, data.status, data.note, data.until);
+      broadcastPresence(ctx.projectId);
+      if (data.clientId) send({ type: 'acked', clientId: data.clientId });
+      return;
+    }
+    case 'usage': {
+      // agent 上报本机 CLI 的订阅额度（connector 定时查询 / room usage）
+      if (!st) return;
+      st.usage = cleanUsage(data.usage);
       broadcastPresence(ctx.projectId);
       if (data.clientId) send({ type: 'acked', clientId: data.clientId });
       return;
