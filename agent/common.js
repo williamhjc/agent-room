@@ -122,8 +122,30 @@ export function updateState(conn, patch) {
   const cur = readState(conn);
   const next = { ...cur, ...(typeof patch === 'function' ? patch(cur) : patch) };
   const f = stateFile(conn);
-  fs.writeFileSync(f + '.tmp', JSON.stringify(next, null, 2));
-  fs.renameSync(f + '.tmp', f);
+  const data = JSON.stringify(next, null, 2);
+  // 每个进程用自己的临时文件；Windows 上杀毒软件 / 另一个进程占用时 rename 偶尔报 EPERM，重试几次，
+  // 实在不行直接覆盖写。状态文件写失败绝不能让连接器崩溃或让 room wait 以为断线
+  const tmp = `${f}.${process.pid}.${Math.random().toString(36).slice(2, 8)}.tmp`;
+  try {
+    fs.writeFileSync(tmp, data);
+    for (let i = 0; ; i++) {
+      try {
+        fs.renameSync(tmp, f);
+        break;
+      } catch (e) {
+        if (i >= 5) throw e;
+        const until = Date.now() + 20 * (i + 1);
+        while (Date.now() < until); // 同步小等待，updateState 本身是同步接口
+      }
+    }
+  } catch {
+    try {
+      fs.rmSync(tmp, { force: true });
+      fs.writeFileSync(f, data);
+    } catch (e2) {
+      console.error(`[agent-room] 写状态文件失败：${e2.message}`);
+    }
+  }
   return next;
 }
 
