@@ -20,7 +20,8 @@ const ACK_CHECK_MS = parseInt(process.env.ACK_CHECK_MS || '5000', 10);
 const PUBLIC_DIR = path.join(ROOT, 'public');
 const MAX_TEXT = 100_000;
 const MAX_UPLOAD = 20 * 1024 * 1024;
-const SESSION_WORKING_TTL = 3600_000; // 会话模式下"工作中"状态的最长保留时间
+const SESSION_WORKING_TTL = 3600_000; // 会话模式下"工作中"状态的最长保留时间（每次 room 命令都会续期）
+const WAIT_GRACE_MS = 150_000; // room wait 断开后多久内仍算"在监听"
 
 const store = new Store(DATA_DIR);
 
@@ -39,16 +40,47 @@ function publicProject(p) {
   return { ...rest, hasBark: !!barkUrl, agents: p.agents.map(({ token, ...a }) => a) };
 }
 
-// ---------- Bark 推送（agent 发出【待验收】时通知用户） ----------
-const REVIEW_RE = /【\s*待验收\s*】|\[\s*待验收\s*\]|#待验收/;
-async function sendBark(barkUrl, { title, body, sound, group, url }) {
+// ---------- Bark 推送：只在需要用户本人处理时通知 ----------
+// 1. agent 给出了验收二维码（链接或图片附件）——可以扫码验收了
+// 2. agent 需要用户确认 / 决策：room send --ask，或在消息里 @用户 并提问
+// 不再看【待验收】字样（agent 之间交接也常写，推送太多）
+const QR_URL_RE = /https?:\/\/[^\s<>()\[\]"'`]*(?:qr-?code|\/qr\/|[?&]qr=)[^\s<>()\[\]"'`]*/i;
+const IMG_URL_RE = /https?:\/\/[^\s<>()\[\]"'`]+\.(?:png|jpe?g|webp|gif)\b[^\s<>()\[\]"'`]*/i;
+function findQr(msg) {
+  const text = msg.text || '';
+  const m = text.match(QR_URL_RE);
+  if (m) return m[0];
+  const att = (msg.attachments || []).find((a) => a.type === 'image' && /qr|二维码/i.test(a.name));
+  if (att) return (process.env.PUBLIC_URL || '').replace(/\/$/, '') + att.url;
+  if (/二维码/.test(text)) {
+    const img = text.match(IMG_URL_RE);
+    if (img) return img[0];
+    const a2 = (msg.attachments || []).find((a) => a.type === 'image');
+    if (a2) return (process.env.PUBLIC_URL || '').replace(/\/$/, '') + a2.url;
+  }
+  return null;
+}
+/** 群里"用户"的称呼：默认的「用户」+ 在线网页用户的昵称 + 历史上发过言的用户 */
+function userNames(projectId) {
+  const names = new Set(['用户']);
+  for (const ws of rooms.get(projectId)?.users || []) if (ws.ctx?.name) names.add(ws.ctx.name);
+  for (const m of store.getMessages(projectId).slice(-300)) if (m.fromType === 'user') names.add(m.from);
+  return names;
+}
+function needsConfirm(projectId, msg) {
+  if (msg.meta?.kind === 'ask') return true;
+  const text = msg.text || '';
+  if (!/[?？]/.test(text)) return false;
+  return [...userNames(projectId)].some((n) => text.includes('@' + n));
+}
+async function sendBark(barkUrl, { title, body, sound, group, url, image }) {
   const ctl = new AbortController();
   const t = setTimeout(() => ctl.abort(), 10_000);
   try {
     const res = await fetch(barkUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json; charset=utf-8' },
-      body: JSON.stringify({ title, body, sound: sound || 'birdsong', group, url, level: 'timeSensitive' }),
+      body: JSON.stringify({ title, body, sound: sound || 'birdsong', group, url, image, level: 'timeSensitive' }),
       signal: ctl.signal,
     });
     const data = await res.json().catch(() => ({}));
@@ -62,19 +94,28 @@ function projectLink(p) {
   const base = (process.env.PUBLIC_URL || '').replace(/\/$/, '');
   return base ? `${base}/#/p/${p.id}` : undefined;
 }
-const lastReviewPush = new Map(); // projectId:agent -> ts，防止短时间重复推送
-function notifyReview(p, msg) {
+const lastPush = new Map(); // 防重复：projectId:agent -> ts；qr:<链接> -> ts（同一个二维码被几个 agent 转发只推一次）
+function notifyUser(p, msg, { kind, qr }) {
   if (!p.barkUrl) return;
+  const now = Date.now();
   const key = `${p.id}:${msg.from}`;
-  if (Date.now() - (lastReviewPush.get(key) || 0) < 60_000) return;
-  lastReviewPush.set(key, Date.now());
-  const body = msg.text.replace(REVIEW_RE, '').replace(/[#*`>_]/g, '').replace(/\s+/g, ' ').trim().slice(0, 300);
+  if (now - (lastPush.get(key) || 0) < 60_000) return;
+  if (qr && now - (lastPush.get(`qr:${qr}`) || 0) < 6 * 3600_000) return;
+  lastPush.set(key, now);
+  if (qr) lastPush.set(`qr:${qr}`, now);
+  const body = msg.text
+    .replace(/https?:\/\/\S+/g, '')
+    .replace(/【\s*待验收\s*】|!\[[^\]]*\]\(\s*\)|[#*`>_]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 300);
   sendBark(p.barkUrl, {
-    title: `【待验收】${p.name}`,
-    body: `@${msg.from}：${body || '开发测试已完成，请验收'}`,
+    title: kind === 'qr' ? `【可以验收了】${p.name}` : `【需要你确认】${p.name}`,
+    body: `@${msg.from}：${body || (kind === 'qr' ? '验收二维码已发到群里' : '有事需要你确认')}`,
     sound: p.barkSound,
     group: p.name,
     url: projectLink(p),
+    image: qr && IMG_URL_RE.test(qr) ? qr : undefined,
   }).catch((e) => {
     console.error('[agent-room] Bark 推送失败', e.message);
     systemMessage(p.id, `Bark 推送失败：${e.message}。请在「编辑项目」里检查推送地址。`, { kind: 'ack-timeout' });
@@ -131,6 +172,12 @@ function agentState(projectId, name) {
   }
   return r.agents.get(name);
 }
+const ACTIVE_CMDS = new Set(['send', 'inbox', 'show', 'history', 'get', 'recall', 'status']);
+function cleanInfo(i) {
+  if (!i || typeof i !== 'object') return null;
+  const str = (v, n = 60) => (v == null ? '' : String(v).slice(0, n));
+  return { cli: str(i.cli, 10), model: str(i.model), effort: str(i.effort, 20), source: str(i.source, 10), version: str(i.version, 30), ts: Date.now() };
+}
 function connsOf(st, ...modes) {
   return [...st.conns].filter((ws) => modes.includes(ws.ctx.mode));
 }
@@ -139,6 +186,7 @@ function setAgentStatus(st, status, note = '', until = null) {
   // quota：模型额度用完 / 限流，until 为预计恢复时间（毫秒时间戳）
   st.until = status === 'quota' && Number(until) > 0 ? Number(until) : null;
   if (status !== 'working' && st.status === 'working') st.idleSince = Date.now();
+  if (status === 'working' && st.status !== 'working') st.workingSince = Date.now();
   st.status = status;
   st.note = String(note || '').slice(0, 200);
   st.statusAt = Date.now();
@@ -189,7 +237,9 @@ function presence(projectId) {
     const st = r.agents.get(a.name);
     const listeners = st ? connsOf(st, 'listener') : [];
     const waits = st ? connsOf(st, 'wait') : [];
-    const listening = listeners.length > 0 || waits.length > 0;
+    // 会话模式 room wait 超时后要由 agent 重新运行，中间有几秒到一两分钟的空档，不算离线
+    const waitGrace = !!st && !listeners.length && st.lastMode === 'wait' && Date.now() - (st.waitGoneAt || 0) < WAIT_GRACE_MS;
+    const listening = listeners.length > 0 || waits.length > 0 || waitGrace;
     // 会话模式（room wait）在处理任务时没有常驻连接，但仍算"工作中"
     const sessionWorking = st && st.status === 'working' && Date.now() - (st.statusAt || 0) < SESSION_WORKING_TTL;
     const online = listening || !!sessionWorking;
@@ -206,6 +256,9 @@ function presence(projectId) {
       host: st?.host || '',
       pending: r.pending.get(a.name)?.size || 0,
       usage: st?.usage || null, // 订阅额度（离线也保留最后一次，网页标注时间）
+      info: st?.info || null, // 当前模型 / CLI 版本
+      lastActivity: st?.lastActivity || null,
+      workingSince: online && st.status === 'working' ? st.workingSince || null : null,
     };
   });
 }
@@ -244,15 +297,13 @@ function postMessage(projectId, { from, fromType, text, replyTo, attachments, me
     const parent = replyTo && findMessage(history, replyTo);
     depth = parent ? (parent.depth || 0) + 1 : 1;
   }
-  const mentions = fromType === 'system' ? [] : parseMentions(text, p.agents).filter((n) => n !== from);
+  // 系统消息和 agent 的自动进展消息只展示，不派活
+  const mentions = fromType === 'system' || meta?.kind === 'progress' ? [] : parseMentions(text, p.agents).filter((n) => n !== from);
   let dispatch = mentions;
   let notice = null;
   if (p.paused && mentions.length) {
     dispatch = [];
     notice = '项目已暂停，@提及不会触发 agent。点击「恢复」后重新发送。';
-  } else if (fromType === 'agent' && depth >= p.maxHops && mentions.length) {
-    dispatch = [];
-    notice = `已达到 agent 自动接力上限（${p.maxHops} 轮），请用户介入后再继续。`;
   }
   const msg = {
     id: newId(12),
@@ -268,16 +319,23 @@ function postMessage(projectId, { from, fromType, text, replyTo, attachments, me
   };
   if (attachments?.length) msg.attachments = attachments;
   if (meta) msg.meta = meta;
-  const isReview = fromType === 'agent' && REVIEW_RE.test(text);
-  if (isReview) msg.meta = { ...(msg.meta || {}), kind: 'review' };
+  // 需要用户本人处理的消息：给出验收二维码 → review；需要用户确认 → ask。这两种推送 Bark
+  let push = null;
+  if (fromType === 'agent' && !['progress', 'quota', 'quota-ok'].includes(meta?.kind)) {
+    const qr = findQr(msg);
+    if (qr) push = { kind: 'qr', qr };
+    else if (needsConfirm(projectId, msg)) push = { kind: 'ask' };
+    if (push) msg.meta = { ...(msg.meta || {}), kind: push.kind === 'qr' ? 'review' : 'ask', ...(push.qr ? { qr: push.qr } : {}) };
+  }
   store.addMessage(projectId, msg);
-  if (isReview) notifyReview(p, msg);
+  if (push) notifyUser(p, msg, push);
   const quotaNotes = [];
 
   // 发送者是 agent：更新活跃时间；不支持回执的旧客户端，发言即视为已接单
   if (fromType === 'agent') {
     const st = agentState(projectId, from);
     st.lastActivity = Date.now();
+    if (meta?.kind !== 'progress') st.lastPostAt = Date.now();
     if (!st.ackCapable && pendingOf(projectId, from).size) {
       pendingOf(projectId, from).clear();
       markPendingDirty();
@@ -311,6 +369,17 @@ function fmtLeft(until) {
 function findMessage(history, id) {
   for (let i = history.length - 1; i >= 0; i--) if (history[i].id === id) return history[i];
   return null;
+}
+
+/** 撤回：清空内容、取消派发（还没接单的不再派；正在处理的连接器会收到通知自行停止） */
+function recallMessage(projectId, m, by) {
+  if (m.recalled) return;
+  const targets = m.dispatch || [];
+  const updated = store.updateMessage(projectId, m.id, { recalled: true, recalledBy: by, recalledAt: Date.now(), text: '', attachments: [], mentions: [], dispatch: [] });
+  for (const name of targets) pendingOf(projectId, name).delete(m.id);
+  markPendingDirty();
+  broadcast(projectId, { type: 'recall', id: m.id, message: updated });
+  broadcastPresence(projectId);
 }
 
 function ackMessages(projectId, agent, ids) {
@@ -633,6 +702,10 @@ wss.on('connection', (ws, req) => {
     if (!st) return;
     st.conns.delete(ws);
     if (ctx.mode === 'listener' && !connsOf(st, 'listener').length && st.status === 'working') setAgentStatus(st, 'idle');
+    if (ctx.mode === 'wait' && !connsOf(st, 'wait').length) {
+      st.waitGoneAt = Date.now();
+      setTimeout(() => broadcastPresence(ctx.projectId), WAIT_GRACE_MS + 1000).unref?.();
+    }
     if (ctx.mode !== 'tool') broadcastPresence(ctx.projectId);
   });
 });
@@ -687,7 +760,18 @@ function onHello(ws, data, send, req) {
       st.host = String(data.host || req.socket.remoteAddress || '').slice(0, 100);
       st.lastMode = mode;
     }
-    if (mode === 'wait') setAgentStatus(st, 'idle', '等待新消息');
+    if (data.info) st.info = cleanInfo(data.info);
+    const noListener = !connsOf(st, 'listener').length;
+    if (mode === 'wait') {
+      // 正在干活的会话可能把 room wait 放到后台跑：开始干活后还没发过言，就继续算"工作中"（最多 30 分钟）
+      const busy = st.status === 'working' && (st.lastPostAt || 0) < (st.workingSince || 0) && Date.now() - (st.workingSince || 0) < 30 * 60_000;
+      if (!busy && st.status !== 'quota') setAgentStatus(st, 'idle', '等待新消息');
+    } else if (mode === 'tool' && noListener && ACTIVE_CMDS.has(data.cmd) && st.status !== 'quota') {
+      // 会话模式在两次 room wait 之间用 room send / inbox 等命令，说明它正在干活
+      if (st.status === 'working') st.statusAt = Date.now();
+      else setAgentStatus(st, 'working', '会话处理中');
+      broadcastPresence(p.id);
+    }
     const { token, ...self } = def;
     const n = Math.min(500, Math.max(1, parseInt(data.historyLimit || 100, 10)));
     send({
@@ -774,7 +858,7 @@ function cleanUsage(u) {
 
 /** agent 发言可附带的展示标记（白名单） */
 function agentMeta(meta) {
-  if (!meta || !['quota', 'quota-ok'].includes(meta.kind)) return undefined;
+  if (!meta || !['quota', 'quota-ok', 'progress', 'ask'].includes(meta.kind)) return undefined;
   return { kind: meta.kind, until: Number(meta.until) > 0 ? Number(meta.until) : undefined };
 }
 
@@ -810,6 +894,23 @@ function onMessage(ws, data, send) {
       if (!st) return;
       setAgentStatus(st, data.status, data.note, data.until);
       broadcastPresence(ctx.projectId);
+      if (data.clientId) send({ type: 'acked', clientId: data.clientId });
+      return;
+    }
+    case 'info': {
+      if (!st) return;
+      st.info = cleanInfo(data.info);
+      broadcastPresence(ctx.projectId);
+      if (data.clientId) send({ type: 'acked', clientId: data.clientId });
+      return;
+    }
+    case 'recall': {
+      // 撤回：网页用户可以撤回任何消息；agent 只能撤回自己的
+      const m = findMessage(store.getMessages(ctx.projectId), String(data.id || ''));
+      if (!m) return send({ type: 'error', error: '消息不存在', clientId: data.clientId });
+      if (ctx.kind === 'agent' && !(m.fromType === 'agent' && m.from === ctx.agent)) return send({ type: 'error', error: '只能撤回自己发的消息', clientId: data.clientId });
+      if (m.fromType === 'system') return send({ type: 'error', error: '系统消息不能撤回', clientId: data.clientId });
+      recallMessage(ctx.projectId, m, ctx.kind === 'agent' ? ctx.agent : ctx.name);
       if (data.clientId) send({ type: 'acked', clientId: data.clientId });
       return;
     }

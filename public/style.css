@@ -268,6 +268,9 @@ select.input option { background: var(--panel-solid); }
 .member-actions { display: flex; gap: 5px; flex-wrap: wrap; }
 .members-actions { padding: 12px 14px; display: flex; flex-direction: column; gap: 6px; border-top: 1px solid var(--border); }
 .pend { font: 600 10.5px var(--mono); background: rgba(245, 158, 11, 0.16); color: #ffcf7a; border-radius: 999px; padding: 0 7px; }
+.model-tag { font: 600 10px var(--mono); color: #e9d5ff; background: rgba(139, 92, 246, 0.16); border: 1px solid rgba(139, 92, 246, 0.4); border-radius: 5px; padding: 0 5px; max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.model-tag.dim { color: var(--muted); background: transparent; border-style: dashed; }
+.st-working .stage-caption { white-space: normal; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
 .mode-tag { font: 10px var(--mono); color: var(--accent); border: 1px dashed rgba(56, 232, 255, 0.4); border-radius: 5px; padding: 0 5px; }
 
 /* 订阅额度 */
@@ -458,3 +461,15 @@ select.input option { background: var(--panel-solid); }
   .grid2 { grid-template-columns: 1fr; }
   .atts img { max-width: 100%; }
 }
+
+/* 撤回 / 自动进展 */
+.msg-act { margin-left: 2px; border: 0; background: none; color: var(--muted); font-size: 11.5px; cursor: pointer; padding: 0 4px; border-radius: 5px; opacity: 0; transition: opacity .15s; }
+.msg:hover .msg-act, .msg-act:focus-visible { opacity: .85; }
+.msg-act:hover { color: var(--danger); background: rgba(255, 77, 109, 0.1); }
+@media (hover: none) { .msg-act { display: none; } .msg.mine .msg-act { display: inline-block; opacity: .7; } }
+.msg.system .sys.recalled { font-style: italic; opacity: .75; }
+.progress-badge { font: 600 10px var(--mono); color: #9fdcff; border: 1px dashed rgba(56, 232, 255, 0.45); border-radius: 999px; padding: 0 7px; }
+.msg.progress-msg .bubble { font-size: 12.5px; color: #b8c6e6; background: rgba(18, 26, 48, 0.55); border-style: dashed; padding: 7px 12px; }
+.msg.progress-msg .avatar { opacity: .7; }
+.review-badge.ask { color: #2a1a00; background: linear-gradient(90deg, #fbbf24, #f59e0b); box-shadow: 0 0 10px rgba(245, 158, 11, .45); }
+.msg.ask-msg .bubble { border-color: rgba(245, 158, 11, 0.6); box-shadow: 0 0 18px rgba(245, 158, 11, 0.14); }

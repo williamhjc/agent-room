@@ -5,14 +5,14 @@
 // 用法：
 //   node agent/connector.js --server ws://HOST:8787/ws --project <ID> --agent <名称> --token <TOKEN> \
 //        [--workdir 路径] [--cli claude|codex] [--bin 可执行文件] [--permission 模式] [--yolo] \
-//        [--model 模型] [--extra "额外参数"] [--timeout 分钟，默认 720] [--limit-retry 分钟] [--usage-interval 分钟，默认 5，0 关闭] [--history 条数]
+//        [--model 模型] [--extra "额外参数"] [--timeout 分钟，默认 720] [--limit-retry 分钟] [--usage-interval 分钟，默认 5，0 关闭] [--progress-interval 分钟，默认 20，0 关闭] [--history 条数]
 // 连接信息也可以来自环境变量 AGENT_ROOM_* 或当前目录的 .agent-room.json（room init 生成）。
 import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { WS, parseArgs, loadConn, httpBase, stateDir, readState, updateState, fmtMessage, ensureRoomShim, detectLimit, looksLikeLimitResult, fetchUsage, fmtUsage } from './common.js';
+import { WS, parseArgs, loadConn, httpBase, stateDir, readState, updateState, fmtMessage, ensureRoomShim, detectLimit, looksLikeLimitResult, fetchUsage, fmtUsage, detectModel } from './common.js';
 
 const ROOM_TOOL = path.join(path.dirname(fileURLToPath(import.meta.url)), 'room.js');
 const SHIM_DIR = ensureRoomShim(ROOM_TOOL); // 提供 `room` 短命令给 CLI 子进程
@@ -36,6 +36,8 @@ const cfg = {
   limitRetryMin: parseFloat(args['limit-retry'] || env.AGENT_ROOM_LIMIT_RETRY || '30'), // 额度用完但不知道何时恢复时，多久重试一次
   // 多久查一次订阅额度（分钟），显示在网页上；额度用完时每 2 分钟查一次，发现恢复就提前重试
   usageMin: parseFloat(args['usage-interval'] ?? env.AGENT_ROOM_USAGE_INTERVAL ?? '5'),
+  // 长任务执行中，每隔多少分钟自动在群里发一次进展（有变化才发）；0 关闭
+  progressMin: parseFloat(args['progress-interval'] ?? env.AGENT_ROOM_PROGRESS ?? '20'),
   backlogHours: parseFloat(args['backlog-hours'] || env.AGENT_ROOM_BACKLOG_HOURS || '24'),
   historyN: parseInt(args.history || env.AGENT_ROOM_HISTORY || '40', 10),
   noResume: !!args['no-resume'],
@@ -47,6 +49,12 @@ if (!cfg.project || !cfg.agent || !cfg.token) {
 }
 if (!fs.existsSync(cfg.workdir)) fs.mkdirSync(cfg.workdir, { recursive: true });
 const base = httpBase(cfg.server);
+
+// 给 CLI 子进程用的连接信息文件。只靠环境变量不够：Codex 默认会过滤名字含 TOKEN 的环境变量，
+// room 拿不到 token 时以前会退回当前目录的 .agent-room.json——同一台电脑跑多个项目时可能是另一个项目的
+const CONN_FILE = path.join(stateDir, `${cfg.project}-${String(cfg.agent).replace(/[^\w-]/g, '_')}.conn.json`);
+fs.mkdirSync(stateDir, { recursive: true });
+fs.writeFileSync(CONN_FILE, JSON.stringify({ server: cfg.server, project: cfg.project, agent: cfg.agent, token: cfg.token }, null, 2), { mode: 0o600 });
 
 const log = (...a) => console.log(`[${new Date().toLocaleTimeString()}] [${cfg.agent}]`, ...a);
 
@@ -152,7 +160,10 @@ function onServer(data) {
         if (isLimited()) log(`额度用完，等待恢复（预计 ${fmtClock(state.limited.until)}）`);
         scheduleLimitRetry();
       }
-      setStatus(running ? 'working' : 'idle');
+      if (running) setStatus('working', workingNote());
+      else setStatus('idle');
+      reportInfo();
+      checkWorkdirShared();
       // 重连后把额度信息重新报给服务端（太旧就重新查）
       if (lastUsage && Date.now() - lastUsage.ts < 10 * 60_000) send({ type: 'usage', usage: lastUsage });
       else refreshUsage();
@@ -183,9 +194,24 @@ function onServer(data) {
         } else if (running) {
           // 排队情况实时反映到群成员状态上（网页能看到"排队 N 条"）
           log(`正在执行任务，排队 ${pending.length} 条`);
-          setStatus('working', `${runNote} · 排队 ${pending.length} 条`);
+          setStatus('working', workingNote());
         }
         pump();
+      }
+      return;
+    }
+    case 'recall': {
+      // 消息被撤回：从排队里拿掉；正在处理的任务只剩被撤回的消息时，停止执行
+      const id = data.id;
+      for (const m of [...history, ...pending, ...currentTriggers]) if (m.id === id) Object.assign(m, { recalled: true, text: '', attachments: [] });
+      const n = pending.length;
+      pending = pending.filter((m) => m.id !== id);
+      if (pending.length !== n) log(`排队中的消息 ${id} 被撤回，已移除`);
+      if (state.limited?.ids?.includes(id)) saveState({ limited: { ...state.limited, ids: state.limited.ids.filter((x) => x !== id) } });
+      if (running && currentTriggers.some((m) => m.id === id) && currentTriggers.every((m) => m.recalled)) {
+        log('正在处理的消息被撤回，中止任务');
+        running.recalled = true;
+        killRunning();
       }
       return;
     }
@@ -228,7 +254,7 @@ async function pump() {
   // 执行期间 CLI 已经通过 room inbox 看到（并确认）的消息，不再单独开一轮
   const seenByChild = readState(conn).seenTs || 0;
   const skipped = pending.filter((m) => m.ts <= seenByChild && state.lastRunEnd && m.ts > state.lastRunStart);
-  const triggers = pending.filter((m) => !skipped.includes(m));
+  const triggers = pending.filter((m) => !skipped.includes(m) && !m.recalled);
   pending = [];
   if (skipped.length) log(`${skipped.length} 条消息已在上一轮执行中通过 room inbox 处理，跳过`);
   if (!triggers.length) return;
@@ -238,7 +264,8 @@ async function pump() {
   // 确认接单：服务端据此判断 agent 没有"停"
   send({ type: 'ack', ids: triggers.map((m) => m.id) });
   runNote = `处理 ${last.from} 的消息`;
-  setStatus('working', runNote);
+  actReset();
+  setStatus('working', workingNote());
   const prompt = buildPrompt(triggers);
   const runStart = Date.now();
   if (state.limited) limitLastTry = runStart;
@@ -264,16 +291,181 @@ async function pump() {
     log('执行失败：', e.message);
     if (e.timedOut) {
       reply = `⚠️ 这次任务执行超过 ${fmtDuration(cfg.timeoutMin * 60_000)}，被连接器终止（--timeout 上限），结果可能不完整。需要继续请再 @我（会接着上次的会话），或调大连接器的 --timeout（0 为不限制）。`;
-    } else reply = e.cancelled ? null : `⚠️ 执行出错：${e.message.slice(0, 1500)}`;
-    setStatus('error', e.message.slice(0, 120));
+    } else if (e.cancelled) reply = running?.recalled ? '（对应的消息已被撤回，任务已停止）' : null;
+    else reply = `⚠️ 执行出错：${e.message.slice(0, 1500)}`;
   }
   if (reply !== null) post(reply.trim() || '（无输出）', last.id);
   saveState({ doneTs: last.ts, lastRunEnd: Date.now() });
   running = null;
+  act = null;
   currentTriggers = [];
   setStatus('idle');
   refreshUsage();
   setImmediate(pump);
+}
+
+// ---------- 执行过程：实时动作（显示在工位卡片上）+ 定期在群里发进展 ----------
+let act = null; // { start, lastEventAt, action, text, todos, lastPostAt, lastPostKey }
+let actTimer = null;
+const short = (s, n) => {
+  s = String(s ?? '').replace(/\s+/g, ' ').trim();
+  return s.length > n ? s.slice(0, n - 1) + '…' : s;
+};
+function actReset() {
+  const now = Date.now();
+  act = { start: now, lastEventAt: now, action: '', text: '', todos: null, lastPostAt: now, lastPostKey: null };
+}
+function workingNote() {
+  const parts = [runNote];
+  if (act?.action) parts.push(act.action);
+  if (pending.length) parts.push(`排队 ${pending.length} 条`);
+  return parts.filter(Boolean).join(' · ');
+}
+/** CLI 有新动作：记下来，3 秒内合并成一次状态更新 */
+function noteAction(action = '', text = '') {
+  if (!act) return;
+  act.lastEventAt = Date.now();
+  if (action) act.action = short(action, 80);
+  if (text) act.text = text;
+  if (actTimer) return;
+  actTimer = setTimeout(() => {
+    actTimer = null;
+    if (running && act) setStatus('working', workingNote());
+  }, 3000);
+}
+function describeTool(name, i = {}) {
+  const base = (p) => (p ? path.basename(String(p)) : '');
+  switch (name) {
+    case 'Bash':
+    case 'PowerShell':
+      return `运行 ${short(i.command, 70)}`;
+    case 'Edit':
+    case 'MultiEdit':
+    case 'Write':
+    case 'NotebookEdit':
+      return `编辑 ${base(i.file_path || i.notebook_path)}`;
+    case 'Read':
+      return `查看 ${base(i.file_path)}`;
+    case 'Grep':
+    case 'Glob':
+      return `搜索 ${short(i.pattern, 40)}`;
+    case 'WebFetch':
+    case 'WebSearch':
+      return `查资料 ${short(i.query || i.url, 50)}`;
+    case 'Task':
+    case 'Agent':
+      return `派子任务 ${short(i.description, 40)}`;
+    default:
+      return `调用 ${name}`;
+  }
+}
+function onClaudeEvent(ev) {
+  if (ev.type === 'system' && ev.subtype === 'init' && ev.model) setModel(ev.model, 'cli');
+  if (ev.type === 'assistant') {
+    for (const c of ev.message?.content || []) {
+      if (c.type === 'text' && c.text?.trim()) noteAction('', c.text);
+      else if (c.type === 'tool_use' && c.name === 'TodoWrite' && act) {
+        act.todos = (c.input?.todos || []).map((t) => ({ text: t.status === 'in_progress' && t.activeForm ? t.activeForm : t.content, done: t.status === 'completed', active: t.status === 'in_progress' }));
+        noteAction('更新任务清单');
+      } else if (c.type === 'tool_use') noteAction(describeTool(c.name, c.input));
+    }
+  } else noteAction();
+}
+function onCodexEvent(ev) {
+  const it = ev.item || {};
+  const old = ev.msg || {}; // 旧版事件格式
+  const t = it.type || it.item_type;
+  if (t === 'command_execution') noteAction(`运行 ${short(it.command, 70)}`);
+  else if (old.type === 'exec_command_begin') noteAction(`运行 ${short([].concat(old.command || []).join(' '), 70)}`);
+  else if (t === 'file_change') noteAction(`编辑 ${(it.changes || []).map((c) => path.basename(String(c.path || ''))).slice(0, 3).join('、')}`);
+  else if (t === 'agent_message' && it.text) noteAction('', it.text);
+  else if (old.type === 'agent_message' && old.message) noteAction('', old.message);
+  else if (t === 'todo_list' && act) {
+    act.todos = (it.items || []).map((x) => ({ text: x.text, done: !!x.completed }));
+    noteAction('更新任务清单');
+  } else if (t === 'mcp_tool_call') noteAction(`调用 ${it.server || ''}.${it.tool || ''}`);
+  else if (t === 'web_search') noteAction(`搜索 ${short(it.query, 50)}`);
+  else if (t === 'reasoning') noteAction('思考中');
+  else noteAction();
+}
+function todoSummary() {
+  const t = act?.todos;
+  if (!t?.length) return '';
+  const done = t.filter((x) => x.done).length;
+  const cur = t.find((x) => x.active) || t.find((x) => !x.done);
+  return `任务清单 ${done}/${t.length} 完成${cur ? `，当前：${short(cur.text, 60)}` : ''}`;
+}
+/** 长任务定期在群里报一次进展；内容没变化就不发，长时间没输出时提示可能卡住 */
+function maybePostProgress() {
+  if (!running || !act || cfg.progressMin <= 0 || !project) return;
+  const now = Date.now();
+  if (now - act.lastPostAt < cfg.progressMin * 60_000) return;
+  act.lastPostAt = now;
+  const idle = now - act.lastEventAt;
+  const stalled = idle > 15 * 60_000;
+  const lines = [];
+  const todo = todoSummary();
+  if (todo) lines.push(`- ${todo}`);
+  if (act.action) lines.push(`- 最近动作：${act.action}`);
+  if (act.text) lines.push(`- 最新说明：${short(act.text, 300)}`);
+  const key = lines.join('\n');
+  if (key === act.lastPostKey && !stalled) return;
+  act.lastPostKey = key;
+  if (stalled) lines.push(`- ⚠️ 已经 ${fmtDuration(idle)}没有任何输出，可能卡住了；需要的话在工位卡片上点「中止」`);
+  const last = currentTriggers.at(-1);
+  // 进展消息不派活：把 @ 换成全角，避免误触发别人
+  const text = `⏳ 进展：仍在处理 ${last?.from || ''} 的任务（已 ${fmtDuration(now - act.start)}）\n${lines.join('\n') || '- 正在思考 / 执行中'}`.replace(/@/g, '＠');
+  send({ type: 'message', text, replyTo: last?.id, meta: { kind: 'progress' } });
+}
+setInterval(maybePostProgress, Math.max(500, Math.min(30_000, (cfg.progressMin * 60_000) / 2))).unref?.();
+
+// ---------- 当前模型 / CLI 版本（显示在工位卡片上） ----------
+let modelInfo = null;
+let cliVersion = null;
+function reportInfo() {
+  if (!self) return;
+  const cli = agentCli();
+  if (!modelInfo || modelInfo.cli !== cli) modelInfo = { cli, ...detectModel(cli, { model: cfg.model, extra: cfg.extra }) };
+  if (cliVersion === null && !cfg.dryRun) {
+    cliVersion = '';
+    try {
+      const bin = cfg.bin || cli;
+      const w = process.platform === 'win32' ? resolveWinBin(bin) : { file: bin, shell: false };
+      const r = spawnSync(w.file, ['--version'], { encoding: 'utf8', timeout: 15000, shell: w.shell, windowsHide: true });
+      cliVersion = short((r.stdout || '').match(/\d+\.\d+\.\d+[\w.-]*/)?.[0] || '', 30);
+    } catch {}
+  }
+  send({ type: 'info', info: { ...modelInfo, version: cliVersion || '' } });
+}
+function setModel(model, source) {
+  if (!model || (modelInfo?.model === model && modelInfo?.source === source)) return;
+  modelInfo = { ...(modelInfo || { cli: agentCli() }), model, source };
+  reportInfo();
+}
+
+// ---------- 同一台电脑上多个项目共用工作目录：提醒一下（容易串项目） ----------
+let workdirChecked = false;
+function checkWorkdirShared() {
+  if (workdirChecked) return;
+  workdirChecked = true;
+  saveState({ workdir: cfg.workdir });
+  const others = [];
+  try {
+    for (const f of fs.readdirSync(stateDir)) {
+      if (!f.endsWith('.json') || /\.(conn|tmp)\.json$/.test(f) || f.startsWith(`${cfg.project}-`)) continue;
+      const st = (() => {
+        try {
+          return JSON.parse(fs.readFileSync(path.join(stateDir, f), 'utf8'));
+        } catch {
+          return {};
+        }
+      })();
+      if (st.workdir && path.resolve(st.workdir) === cfg.workdir) others.push(f.replace(/\.json$/, ''));
+    }
+  } catch {}
+  if (!others.length) return;
+  log(`⚠️ 本机另有连接器使用同一个工作目录：${others.join('、')}。不同项目请用不同的 --workdir，否则 CLI 会看到别的项目的文件和会话，容易串项目。`);
+  post(`⚠️ 提醒：本机（${os.hostname()}）上还有别的项目的 agent（${others.join('、')}）和我共用工作目录 ${cfg.workdir}。不同项目共用目录容易串项目，建议给每个项目单独的 --workdir。`);
 }
 
 // ---------- 额度用完 / 限流 ----------
@@ -447,7 +639,9 @@ function buildPrompt(triggers) {
 6. 只用你自己的身份 @${cfg.agent} 发言，绝不冒充用户或其他成员。
 7. 截图等图片用 room send --attach 发送，不要把 base64 贴进消息。
 8. 如果群里提示某个成员"额度用完"，不要干等或反复 @它：先推进不依赖它的工作，必须由它做的部分等它恢复后自己接着做。
-9. 一项需求开发和测试都完成、需要用户（人类）亲自验收时，在回复第一行写【待验收】，接着写清楚：做了什么、怎么验收（打开哪里、操作步骤、预期结果）、已知问题。用户会收到手机推送。只在真正需要用户验收时使用，中间进度、agent 之间交接不要用。`;
+9. 用户手机推送只在两种情况发出：① 消息里给出了验收二维码链接（出包后把二维码链接单独一行贴出来）；② 需要用户本人确认或决策——@用户 并用问句写清楚要确认什么（选项、影响、你的建议）。请用户验收时写清楚：做了什么、怎么验收（打开哪里、操作步骤、预期结果）、已知问题。不要为了引起注意而 @用户 提问，进度同步不要用问句 @用户。
+10. 及时反馈进展：预计超过 10 分钟的任务，开始时用 room send 说一句计划（做什么、大概多久）；之后每完成一个阶段或遇到阻塞，用 room send 发一句进展（做完了什么、下一步、卡在哪）。进展消息不要 @ 别人。
+11. 你只属于项目「${project.name}」。room 命令只会收发本项目的消息；如果看到明显属于其他项目的内容（别的仓库、别的成员名），不要处理，在回复里说明。`;
 
   const resumed = state.primed && state.sessionId && !cfg.noResume;
   if (resumed) {
@@ -455,7 +649,7 @@ function buildPrompt(triggers) {
     const seenTs = Math.max(state.seenTs || 0, readState(conn).seenTs || 0);
     const trigIds = new Set(triggers.map((m) => m.id));
     const fresh = history.filter((m) => m.ts > seenTs && m.from !== cfg.agent && !trigIds.has(m.id));
-    return `${fresh.length ? `【你上次之后群里的其他新消息】\n${fresh.map(fmt).join('\n\n')}\n\n` : ''}【需要你处理的消息】\n${trig}${multi}\n\n（提醒：最终输出会原样发到群里；需要别人接手就 @ 对方；需要用户验收时第一行写【待验收】；可用 room inbox 查看执行期间的新消息。）\n请完成后给出你要发到群里的回复：`;
+    return `【项目「${project.name}」· 你是 @${cfg.agent} · 工作目录 ${cfg.workdir}】只处理本项目的事。\n\n${fresh.length ? `【你上次之后群里的其他新消息】\n${fresh.map(fmt).join('\n\n')}\n\n` : ''}【需要你处理的消息】\n${trig}${multi}\n\n（提醒：最终输出会原样发到群里；需要别人接手就 @ 对方；需要用户确认时 @用户 并提问；长任务用 room send 及时发进展；可用 room inbox 查看执行期间的新消息。）\n请完成后给出你要发到群里的回复：`;
   }
   const recent = history.slice(-cfg.historyN).map(fmt).join('\n\n');
   return `你是多 agent 协作项目「${project.name}」中的成员 @${cfg.agent}，由 ${cliName} 驱动。
@@ -491,8 +685,9 @@ function quoteWin(s) {
 }
 
 function killRunning() {
-  if (!running?.child) return false;
+  if (!running) return false;
   running.cancelled = true;
+  if (!running.child) return true; // 还没启动 CLI：exec 看到 cancelled 就不会再启动
   const pid = running.child.pid;
   try {
     if (process.platform === 'win32') spawnSync('taskkill', ['/pid', String(pid), '/T', '/F']);
@@ -520,8 +715,17 @@ function resolveWinBin(bin) {
   return found;
 }
 
-function exec(bin, argv, input) {
+/**
+ * 启动 CLI。onEvent：每行 JSON 事件实时回调（用来更新"正在做什么"）；
+ * keep(ev)：哪些 JSON 行留在返回的 stdout 里（工具输出可能很大，长任务全留会占满内存），默认全留
+ */
+function exec(bin, argv, input, { onEvent, keep } = {}) {
   return new Promise((resolve, reject) => {
+    if (running?.cancelled) {
+      const err = new Error('已中止');
+      err.cancelled = true;
+      return reject(err);
+    }
     const isWin = process.platform === 'win32';
     const w = isWin ? resolveWinBin(bin) : { file: bin, shell: false };
     const child = spawn(w.file, w.shell ? argv.map(quoteWin) : argv, {
@@ -535,15 +739,41 @@ function exec(bin, argv, input) {
         AGENT_ROOM_PROJECT: cfg.project,
         AGENT_ROOM_AGENT: cfg.agent,
         AGENT_ROOM_TOKEN: cfg.token,
+        AGENT_ROOM_CONFIG: CONN_FILE, // token 被过滤时 room 从这里读，不会退回到别的项目的配置
         AGENT_ROOM_TOOL: ROOM_TOOL,
         [pathKey]: SHIM_DIR + path.delimiter + (process.env[pathKey] || ''),
       },
       windowsHide: true,
     });
-    running = { child, cancelled: running?.cancelled || false };
+    running = { ...(running || { cancelled: false }), child };
     let stdout = '';
     let stderr = '';
-    child.stdout.on('data', (d) => (stdout += d));
+    let partial = '';
+    child.stdout.setEncoding('utf8'); // 避免多字节字符被切在两个数据块之间
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (d) => {
+      if (!onEvent && !keep) return void (stdout += d);
+      partial += d;
+      const lines = partial.split('\n');
+      partial = lines.pop();
+      for (const line of lines) handleLine(line);
+    });
+    const handleLine = (line) => {
+      const t = line.trim();
+      if (!t) return;
+      let ev = null;
+      if (t.startsWith('{')) {
+        try {
+          ev = JSON.parse(t);
+        } catch {}
+      }
+      if (ev) {
+        try {
+          onEvent?.(ev);
+        } catch {}
+        if (!keep || keep(ev)) stdout += t + '\n';
+      } else if (stdout.length < 500_000) stdout += line + '\n';
+    };
     child.stderr.on('data', (d) => {
       stderr += d;
       if (stderr.length > 200_000) stderr = stderr.slice(-100_000);
@@ -562,6 +792,7 @@ function exec(bin, argv, input) {
     });
     child.on('close', (code) => {
       clearTimeout(timer);
+      if (partial) handleLine(partial);
       if (running?.cancelled) {
         const err = new Error(running.timedOut ? '执行超时' : '已中止');
         err.cancelled = true;
@@ -594,7 +825,17 @@ async function runCli(prompt) {
     }
   }
   if (cfg.dryRun) {
-    await new Promise((r) => setTimeout(r, 800));
+    // [模拟耗时:秒] 假装是长任务（可被中止 / 撤回打断），用来测试进展汇报
+    const secs = parseFloat(currentTriggers.map((m) => m.text.match(/\[模拟耗时:(\d+(?:\.\d+)?)\]/)?.[1]).find(Boolean) || '0.8');
+    const end = Date.now() + secs * 1000;
+    while (Date.now() < end) {
+      await new Promise((r) => setTimeout(r, 100));
+      if (running?.cancelled) {
+        const err = new Error('已中止');
+        err.cancelled = true;
+        throw err;
+      }
+    }
     return `（dry-run）我是 @${cfg.agent}，收到：${prompt.split('【需要你处理的消息】')[1]?.trim().slice(0, 300)}`;
   }
   return agentCli() === 'codex' ? runCodex(prompt) : runClaude(prompt);
@@ -603,7 +844,8 @@ async function runCli(prompt) {
 // ---- Claude Code：claude -p，JSON 输出里拿 result 和 session_id ----
 async function runClaude(prompt, allowResume = true) {
   const bin = cfg.bin || 'claude';
-  const argv = ['-p', '--output-format', 'json'];
+  // stream-json：边执行边拿到工具调用和文字，用来显示"正在做什么"、定期发进展；最后一行 type=result 和 json 格式一样
+  const argv = ['-p', '--output-format', 'stream-json', '--verbose'];
   if (cfg.yolo) argv.push('--dangerously-skip-permissions');
   // 默认放行 room 群聊工具，其余 shell 命令仍需 --yolo 或 --extra "--allowedTools ..."
   else argv.push('--permission-mode', cfg.permission || 'acceptEdits', '--allowedTools', 'Bash(room:*)', 'PowerShell(room:*)');
@@ -612,13 +854,22 @@ async function runClaude(prompt, allowResume = true) {
   if (resume) argv.push('--resume', state.sessionId);
   argv.push(...cfg.extra);
   log(`执行：${bin} ${argv.join(' ')}`);
-  const { code, stdout, stderr } = await exec(bin, argv, prompt);
+  const { code, stdout, stderr } = await exec(bin, argv, prompt, { onEvent: onClaudeEvent, keep: (ev) => ev.type === 'result' });
   let out = null;
-  try {
-    out = JSON.parse(stdout.trim().split('\n').filter(Boolean).pop());
-  } catch {}
+  const plain = [];
+  for (const line of stdout.split('\n')) {
+    if (!line.trim()) continue;
+    if (!line.trim().startsWith('{')) {
+      plain.push(line);
+      continue;
+    }
+    try {
+      const o = JSON.parse(line);
+      if (o.type === 'result' || (!out && 'result' in o)) out = o;
+    } catch {}
+  }
   // 额度用完 / 限流：先于"续接失败重试"判断，避免白白丢掉会话
-  const errText = out ? (out.is_error ? `${out.result || ''} ${out.subtype || ''}` : looksLikeLimitResult(out.result) ? out.result : '') : `${stderr}\n${stdout}`;
+  const errText = out ? (out.is_error ? `${out.result || ''} ${out.subtype || ''}` : looksLikeLimitResult(out.result) ? out.result : '') : `${stderr}\n${plain.join('\n')}`;
   if (errText) throwIfLimit(errText);
   if (!out) {
     if (resume) {
@@ -626,7 +877,7 @@ async function runClaude(prompt, allowResume = true) {
       saveState({ sessionId: null, primed: false });
       return runClaude(buildPrompt(currentTriggers), false);
     }
-    throw new Error(`claude 退出码 ${code}：${(stderr || stdout).trim().slice(-1500)}`);
+    throw new Error(`claude 退出码 ${code}：${(stderr || plain.join('\n')).trim().slice(-1500)}`);
   }
   if (out.session_id) saveState({ sessionId: out.session_id, primed: true });
   if (out.is_error) throw new Error(`claude 返回错误：${out.result || out.subtype || '未知错误'}`);
@@ -650,7 +901,12 @@ async function runCodex(prompt, allowResume = true) {
   if (resume) argv.push(state.sessionId);
   argv.push('-'); // 从 stdin 读取提示词
   log(`执行：${bin} ${argv.join(' ')}`);
-  const { code, stdout, stderr } = await exec(bin, argv, prompt);
+  // 只保留需要的事件行（命令输出可能很大）：会话 id、出错、agent 消息
+  const keep = (ev) => {
+    const t = ev.type || '';
+    return !!(ev.thread_id || ev.session_id || ev.msg?.session_id || /error|failed/.test(t) || /error/.test(ev.msg?.type || '') || (ev.item || ev.msg)?.type === 'agent_message' || ev.item?.item_type === 'agent_message');
+  };
+  const { code, stdout, stderr } = await exec(bin, argv, prompt, { onEvent: onCodexEvent, keep });
   let threadId = null;
   let lastAgentMsg = '';
   let errEvents = '';

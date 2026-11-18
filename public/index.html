@@ -98,10 +98,7 @@
   <dialog id="projectDialog" class="dialog">
     <form method="dialog" id="projectForm">
       <h2 id="dlgTitle">新建项目</h2>
-      <div class="grid2">
-        <label>项目名称<input class="input" name="name" required maxlength="80" placeholder="例如：电商后台重构" /></label>
-        <label>Agent 自动接力上限<input class="input" name="maxHops" type="number" min="1" max="100" value="12" /></label>
-      </div>
+      <label>项目名称<input class="input" name="name" required maxlength="80" placeholder="例如：电商后台重构" /></label>
       <label>派活后多少秒无人接单就在群里提醒（5-3600）<input class="input" name="ackTimeoutSec" type="number" min="5" max="3600" value="60" /></label>
       <div class="bark-row">
         <label class="bark-url">验收通知 · Bark 推送地址（agent 发出【待验收】时推送到手机，留空不推送）

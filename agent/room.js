@@ -3,21 +3,23 @@
 //
 //   node room.js init --server ws://HOST:8787/ws --project ID --agent 名称 --token TOKEN
 //   node room.js wait [--timeout 600]     阻塞等待下一条 @你 的消息（会话模式的核心：干完活就再 wait）
-//   node room.js send "内容" [--attach 图片.png] [--reply 消息id] [--done] [--review 请用户验收，会推送到手机]
+//   node room.js send "内容" [--attach 图片.png] [--reply 消息id] [--done] [--ask 需要用户确认，会推送到手机]
 //   node room.js inbox [--peek]           查看上次之后的新消息（不阻塞）
 //   node room.js show <消息id>            查看某条消息全文
 //   node room.js history [-n 20]          最近的群聊记录
 //   node room.js status working|idle [说明]
 //   node room.js who                      成员与在线状态
 //   node room.js usage [--json]           查看本机 Claude/Codex 订阅额度（并同步到网页）
+//   node room.js model "模型名" [--effort high]  告诉群里你当前用的模型（会话模式用）
+//   node room.js recall <消息id>          撤回自己发的消息
 //   node room.js get <附件URL> [-o 文件]  下载附件
 import fs from 'node:fs';
 import path from 'node:path';
-import { parseArgs, loadConn, connectAgent, readState, updateState, fmtMessage, httpBase, uploadFile, fetchUsage, fmtUsage } from './common.js';
+import { parseArgs, loadConn, connectAgent, readState, updateState, fmtMessage, httpBase, uploadFile, fetchUsage, fmtUsage, detectModel, setClientCmd } from './common.js';
 
 const argv = process.argv.slice(2);
 const cmd = argv[0] && !argv[0].startsWith('--') ? argv.shift() : 'help';
-const args = parseArgs(argv, ['attach'], [], ['review', 'done', 'peek', 'stdin', 'json']);
+const args = parseArgs(argv, ['attach'], [], ['ask', 'review', 'done', 'peek', 'stdin', 'json']);
 const conn = loadConn(args);
 const base = conn.server ? httpBase(conn.server) : '';
 const out = (s = '') => process.stdout.write(s + '\n');
@@ -27,11 +29,22 @@ const die = (s, code = 1) => {
 };
 
 function need() {
+  if (conn.project && conn.agent && !conn.token) {
+    die(`缺少 @${conn.agent} 的 token（项目 ${conn.project}）。如果是在连接器启动的 CLI 里运行，请用 node "${process.env.AGENT_ROOM_TOOL || 'room.js'}"，或检查环境变量 AGENT_ROOM_CONFIG 指向的连接文件；不要改用其他目录里的 .agent-room.json（那可能是另一个项目的）。`);
+  }
   if (!conn.project || !conn.agent || !conn.token) {
     die('缺少连接信息：先运行 room init --server ... --project ... --agent ... --token ...，或设置环境变量 AGENT_ROOM_SERVER / AGENT_ROOM_PROJECT / AGENT_ROOM_AGENT / AGENT_ROOM_TOKEN');
   }
 }
-const isForMe = (m) => m.from !== conn.agent && Array.isArray(m.dispatch) && m.dispatch.includes(conn.agent);
+const isForMe = (m) => !m.recalled && m.from !== conn.agent && Array.isArray(m.dispatch) && m.dispatch.includes(conn.agent);
+/** 会话模式上报当前模型：room model 手动设置的优先，否则读 CLI 配置 */
+function sendInfo(c) {
+  const type = args.cli || c.welcome.self?.type;
+  if (!['claude', 'codex'].includes(type)) return;
+  const st = readState(conn);
+  const info = st.model ? { cli: type, model: st.model, effort: st.effort || '', source: 'self' } : { cli: type, ...detectModel(type) };
+  c.send({ type: 'info', info });
+}
 /** 查本机订阅额度并上报（会话模式靠 room wait 顺带上报，5 分钟最多一次） */
 async function reportUsage(c, force = false) {
   const type = args.cli || c.welcome.self?.type;
@@ -107,13 +120,19 @@ const commands = {
     const c = await connectAgent(conn, {
       mode: 'wait',
       historyLimit: 200,
+      keepalive: true, // 网络静默断开时能察觉并重连，而不是"终端在监听、网页显示离线"
       onMessage: (d) => {
+        if (d.type === 'recall') {
+          for (const m of buffer) if (m.id === d.id) Object.assign(m, { recalled: true, text: '' });
+          return;
+        }
         if (d.type !== 'message') return;
         buffer.push(d.message);
         if (isForMe(d.message)) resolveHit();
       },
       onClose: (ev) => resolveClosed(ev.code === 4009 ? 'replaced' : 'closed'),
     });
+    sendInfo(c);
     reportUsage(c).catch(() => {});
     const pendingIds = new Set(c.welcome.pending || []);
     const hist = c.welcome.history;
@@ -173,18 +192,18 @@ const commands = {
     if (args.file) text = fs.readFileSync(args.file, 'utf8');
     if (args.stdin || (!text && !args.attach)) text = (await readStdin()) || text;
     text = text.trim();
-    // 请用户验收：服务端识别【待验收】后推送 Bark 通知
-    if (args.review && !/【\s*待验收\s*】/.test(text)) text = `【待验收】\n${text}`;
+    // 需要用户本人确认 / 决策：标记后服务端推送 Bark 到用户手机（--review 为旧写法，同义）
+    const meta = args.ask || args.review ? { kind: 'ask' } : undefined;
     const attachments = [];
     for (const f of args.attach || []) attachments.push(await uploadFile(conn, f));
     if (!text && !attachments.length) die('消息为空：room send "内容" 或 --attach 文件');
     const st = readState(conn);
     const replyTo = args.reply && args.reply !== true ? args.reply : st.lastTrigger;
     const c = await connectAgent(conn, { mode: 'tool', historyLimit: 1 });
-    const r = await c.request({ type: 'message', text, attachments, replyTo });
+    const r = await c.request({ type: 'message', text, attachments, replyTo, ...(meta ? { meta } : {}) });
     if (args.done) await c.request({ type: 'status', status: 'idle' }).catch(() => {});
     c.close();
-    out(`已发送（id=${r.id}${attachments.length ? `，附件 ${attachments.length} 个` : ''}）`);
+    out(`已发送到项目「${c.welcome.project.name}」（id=${r.id}${attachments.length ? `，附件 ${attachments.length} 个` : ''}）`);
   },
 
   async show() {
@@ -213,6 +232,26 @@ const commands = {
     await c.request({ type: 'status', status, note: note.join(' ') });
     c.close();
     out(`状态已更新为 ${status}`);
+  },
+
+  async recall() {
+    need();
+    const id = args._[0];
+    if (!id) die('用法：room recall <消息id>（只能撤回自己发的消息）');
+    const c = await connectAgent(conn, { mode: 'tool', historyLimit: 1 });
+    await c.request({ type: 'recall', id }).finally(() => c.close());
+    out(`已撤回 ${id}`);
+  },
+
+  async model() {
+    need();
+    const name = args._.join(' ').trim();
+    if (!name) die('用法：room model "你当前使用的模型名" [--effort high]');
+    updateState(conn, { model: name.slice(0, 60), effort: args.effort && args.effort !== true ? String(args.effort).slice(0, 20) : '' });
+    const c = await connectAgent(conn, { mode: 'tool', historyLimit: 1 });
+    const effort = readState(conn).effort || '';
+    await c.request({ type: 'info', info: { cli: args.cli || c.welcome.self?.type, model: name, effort, source: 'self' } }).finally(() => c.close());
+    out(`已更新：@${conn.agent} 当前模型 ${name}`);
   },
 
   async who() {
@@ -257,5 +296,6 @@ const commands = {
 
 const waitOnce = (deadline) => commands._waitOnceBody(deadline);
 const fn = cmd.startsWith('_') ? null : commands[cmd];
+setClientCmd(cmd);
 if (!fn) die(`未知命令：${cmd}\n运行 room help 查看用法`);
 fn().catch((e) => die('错误：' + e.message));

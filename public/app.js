@@ -135,7 +135,7 @@ async function openProject(id) {
 function renderHeader() {
   const p = S.current;
   $('#projTitle').textContent = p.name;
-  $('#projSub').textContent = p.description || `${p.agents.length} 个 agent · 接力上限 ${p.maxHops} 轮`;
+  $('#projSub').textContent = p.description || `${p.agents.length} 个 agent`;
   $('#btnPause').textContent = p.paused ? '▶ 恢复' : '⏸ 暂停';
   $('#btnPause').title = p.paused ? '恢复后 @ 才会触发 agent' : '暂停后所有 @ 都不会触发 agent';
 }
@@ -191,6 +191,14 @@ function onWs(d) {
       S.messages.push(d.message);
       appendMessage(d.message);
       if (atBottom || d.message.fromType === 'user') scrollBottom();
+      break;
+    }
+    case 'recall': {
+      // 撤回：替换成"某某撤回了一条消息"
+      const i = S.messages.findIndex((m) => m.id === d.id);
+      if (i >= 0) S.messages[i] = d.message;
+      const old = $('#messages').querySelector(`[data-id="${CSS.escape(d.id)}"]`);
+      if (old) old.replaceWith(messageEl(d.message));
       break;
     }
     case 'presence':
@@ -294,6 +302,13 @@ function renderMarkdown(text, mentions = []) {
 
 function messageEl(m) {
   const el = document.createElement('div');
+  el.dataset.id = m.id;
+  if (m.recalled) {
+    el.className = 'msg system';
+    const by = m.recalledBy && m.recalledBy !== m.from ? `（由 ${esc(m.recalledBy)} 撤回）` : '';
+    el.innerHTML = `<div class="sys recalled">${esc(m.from)} 撤回了一条消息${by}</div>`;
+    return el;
+  }
   if (m.fromType === 'system') {
     el.className = 'msg system';
     const k = m.meta?.kind;
@@ -306,15 +321,17 @@ function messageEl(m) {
   const time = t.toLocaleString('zh-CN', { hour12: false, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
   const parent = m.replyTo && S.messages.find((x) => x.id === m.replyTo);
   const kind = m.meta?.kind;
-  el.className = `msg ${isMe ? 'me' : `agent-${type}`}${kind === 'quota' ? ' quota-msg' : kind === 'review' ? ' review-msg' : ''}`;
+  el.className = `msg ${isMe ? 'me' : `agent-${type}`}${kind === 'quota' ? ' quota-msg' : kind === 'review' ? ' review-msg' : kind === 'ask' ? ' review-msg ask-msg' : kind === 'progress' ? ' progress-msg' : ''}${isMe && m.from === S.userName ? ' mine' : ''}`;
   el.innerHTML = `
     <div class="avatar ${type}" title="${esc(m.from)}">${headIcon(type, esc([...m.from][0] || '?'))}</div>
     <div class="msg-body">
       <div class="msg-meta">
         <span class="who">${esc(m.from)}</span>
         ${isMe ? '' : `<span class="tag ${type}">${type === 'codex' ? 'Codex' : 'Claude'}</span>`}
-        ${kind === 'review' ? '<span class="review-badge">待你验收</span>' : ''}
+        ${kind === 'review' ? '<span class="review-badge">可以验收了</span>' : kind === 'ask' ? '<span class="review-badge ask">需要你确认</span>' : ''}
+        ${kind === 'progress' ? '<span class="progress-badge">自动进展</span>' : ''}
         <span class="time">${time}</span>
+        <button class="msg-act" data-recall="${esc(m.id)}" title="撤回这条消息（agent 还没开始处理的任务会取消）">撤回</button>
       </div>
       ${parent ? `<div class="reply-ref">↪ 回复 ${esc(parent.from)}：${esc(parent.text.slice(0, 40))}${parent.text.length > 40 ? '…' : ''}</div>` : ''}
       ${m.text ? `<div class="bubble">${renderMarkdown(m.text, m.mentions)}</div>` : ''}
@@ -349,6 +366,16 @@ function fmtSize(n) {
   return n > 1048576 ? (n / 1048576).toFixed(1) + 'MB' : Math.max(1, Math.round(n / 1024)) + 'KB';
 }
 $('#messages').addEventListener('click', (e) => {
+  const rb = e.target.closest('[data-recall]');
+  if (rb) {
+    const m = S.messages.find((x) => x.id === rb.dataset.recall);
+    const who = m?.fromType === 'user' ? '这条消息' : `@${m?.from} 的这条消息`;
+    if (!confirm(`撤回${who}？
+派给 agent 但还没开始处理的任务会取消；正在处理的会停止。`)) return;
+    if (!S.ws || S.ws.readyState !== 1) return toast('未连接到服务器');
+    S.ws.send(JSON.stringify({ type: 'recall', id: rb.dataset.recall }));
+    return;
+  }
   const img = e.target.closest('img[data-zoom]');
   if (!img) return;
   const lb = document.createElement('div');
@@ -459,11 +486,12 @@ function renderMembers() {
       card.sceneKey = key;
       el.querySelector('.stage-scene').innerHTML = sceneSVG(a.type, state, st);
     }
-    el.querySelector('.stage-caption').textContent = sceneCaption(state, st);
+    const cap = el.querySelector('.stage-caption');
+    cap.textContent = cap.title = sceneCaption(state, st);
     el.querySelector('.status-dot').className = `status-dot ${st.online ? st.status : 'offline'}`;
     el.querySelector('.member-name').innerHTML = `@${esc(a.name)} <span class="tag ${a.type}">${a.type === 'codex' ? 'Codex' : 'Claude'}</span>${
       st.mode ? `<span class="mode-tag">${MODE_TEXT[st.mode] || st.mode}</span>` : ''
-    }${st.pending ? `<span class="pend" title="已派发但还没接单的消息">${st.status === 'working' ? '排队' : '待接单'} ${st.pending}</span>` : ''}`;
+    }${modelTag(st.info)}${st.pending ? `<span class="pend" title="已派发但还没接单的消息">${st.status === 'working' ? '排队' : '待接单'} ${st.pending}</span>` : ''}`;
     el.querySelector('.member-status').textContent = `${statusText(st)}${st.host ? ` · ${st.host}` : ''}`;
     const ub = el.querySelector('.member-usage');
     const uh = usageHTML(st.usage);
@@ -519,11 +547,24 @@ function usageHTML(u) {
   </div>`;
 }
 
+const MODEL_SRC = { cli: 'CLI 实际运行的模型', args: '连接器启动参数指定', config: '来自 CLI 配置文件（会话里用 /model 切换过的话可能不准）', self: 'agent 自己报告的', default: 'CLI 默认模型（没有在参数或配置里指定）' };
+function modelTag(info) {
+  if (!info) return '';
+  const name = info.model || '默认模型';
+  const tip = `${MODEL_SRC[info.source] || ''}${info.version ? ` · ${info.cli} ${info.version}` : ''}`;
+  return `<span class="model-tag ${info.model ? '' : 'dim'}" title="${esc(tip)}">${esc(name)}${info.effort ? ` · ${esc(info.effort)}` : ''}</span>`;
+}
 function statusText(st) {
   let t = st.status === 'idle' && st.mode === 'session' ? (st.listening ? '在线 · 等待消息' : '未在监听') : STATUS_TEXT[st.status] || st.status;
   if (st.status === 'quota' && st.until) t = `额度用完 · ${untilText(st.until)}`;
   // 会话模式自己发现不了额度用完，用额度接口的结果补一句
   else if (st.usage?.limited && !st.usage.error && Date.now() - st.usage.ts < 30 * 60_000) t += ' · 订阅额度已用完';
+  if (st.status === 'working' && st.workingSince) {
+    const min = Math.floor((Date.now() - st.workingSince) / 60_000);
+    t += min < 1 ? ' · 刚开始' : ` · 已 ${min < 60 ? `${min} 分钟` : `${Math.floor(min / 60)} 小时 ${min % 60} 分`}`;
+  }
+  // 会话模式看不到内部进度：给出最后一次动静的时间，方便判断是不是卡住了
+  if (st.mode === 'session' && st.lastActivity && st.status !== 'working') t += ` · 最后活动 ${relTime(st.lastActivity)}`;
   return t;
 }
 $('#memberList').addEventListener('click', (e) => {
@@ -600,7 +641,8 @@ function sessionPrompt(a, os) {
 - 回复：${room} send "内容"（需要别人接手就在内容里 @对方；截图/文件用 --attach 路径，不要贴 base64）
 - 干活中途看新消息：${room} inbox（需求可能变了，例如有了更新的提交号；过时的任务不要继续做）
 - 其他：${room} who 看成员状态；${room} show <id> 看长消息全文；${room} get <附件URL> 下载附件
-- 请用户验收：一项需求开发和测试都完成、需要用户亲自验收时，用 ${room} send --review "做了什么 / 怎么验收（打开哪里、步骤、预期结果）/ 已知问题"，用户会收到手机推送。中间进度和 agent 之间交接不要用
+- 用户手机推送只在两种情况：① 消息里给出验收二维码链接（单独一行）；② 需要用户本人确认/决策时，用 ${room} send --ask "要确认什么、选项、你的建议"。进度同步和 agent 之间交接不要用 --ask
+- 及时反馈进展：长任务开始时说一句计划，每完成一个阶段或遇到阻塞用 ${room} send 发一句进展；开始时运行一次 ${room} model "你当前使用的模型名"，让大家知道你用的模型
 
 工作循环（务必遵守）：
 1. 运行 room wait 拿到任务；
@@ -902,7 +944,6 @@ function openProjectDialog(project) {
   f.name.value = project?.name || '';
   f.description.value = project?.description || '';
   f.workdir.value = project?.workdir || '';
-  f.maxHops.value = project?.maxHops || 12;
   f.ackTimeoutSec.value = project?.ackTimeoutSec || 60;
   f.barkUrl.value = '';
   f.barkUrl.dataset.loaded = project ? '' : '1';
@@ -951,7 +992,6 @@ $('#projectForm').addEventListener('submit', async (e) => {
     name: f.name.value,
     description: f.description.value,
     workdir: f.workdir.value,
-    maxHops: f.maxHops.value,
     ackTimeoutSec: f.ackTimeoutSec.value,
     // 地址还没取回来且没改动时不提交，避免误清空
     ...(f.barkUrl.dataset.loaded || f.barkUrl.value ? { barkUrl: f.barkUrl.value } : {}),
@@ -1039,5 +1079,5 @@ async function boot() {
 window.addEventListener('hashchange', route);
 setInterval(() => S.current || loadProjects().catch(() => {}), 15000);
 // 额度恢复倒计时
-setInterval(() => S.current && S.presence?.some((a) => a.status === 'quota' || a.usage) && renderMembers(), 30000);
+setInterval(() => S.current && S.presence?.some((a) => a.status === 'quota' || a.status === 'working' || a.usage || a.lastActivity) && renderMembers(), 30000);
 boot();

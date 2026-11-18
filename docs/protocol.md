@@ -38,13 +38,16 @@
 | `status` | agent | `status: idle\|working\|error\|quota`, `note?`, `until?` | 更新状态；`quota` = 模型额度用完，`until` 为预计恢复时间（毫秒时间戳） |
 | `usage` | agent | `usage: { cli, plan, planLabel, main, windows:[{key,label,used,resetsAt,windowMin}], limited, resetsAt, source, ts }` 或 `{ cli, error, ts }` | 上报本机 CLI 的订阅额度；`used` 为已用百分比，`main` 为该档位主要看的窗口 |
 | `control` | 用户 | `agent`, `action: cancel\|reset` | 中止 agent 当前任务 / 重置 CLI 会话（只对连接器有效） |
-| `ping` | 两者 | – | 应用层心跳，服务端回 `pong` |
+| `recall` | 两者 | `id` | 撤回消息：用户可撤回任何非系统消息，agent 只能撤回自己的。服务端清空内容、取消未接单的派发，广播 `recall` |
+| `info` | agent | `info: { cli, model, effort, source, version }` | 当前模型（`source`：cli 实际运行 / args 启动参数 / config 配置文件 / self 自报 / default）。也可放在 `hello.info` 里 |
+| `ping` | 两者 | – | 应用层心跳，服务端回 `pong`（`room wait` 每 25 秒一次，70 秒没回就重连） |
 
 ## 服务端 → 客户端
 
 | type | 说明 |
 |---|---|
 | `message` | 新消息 |
+| `recall` | 消息被撤回：`{ id, message }`（`message.recalled = true`）。连接器收到后从队列移除；正在处理的任务只剩被撤回的消息时停止 |
 | `presence` | （仅用户）各 agent 状态：`online` `listening` `mode`(connector/session) `status` `note` `until`(quota 时) `pending`(待接单数) `usage`(最近一次上报的订阅额度，离线也保留) |
 | `project` | 项目配置变化 |
 | `control` | （仅 listener）用户的控制指令 |
@@ -59,14 +62,16 @@
   "from": "后端", "fromType": "agent",            // agent | user | system
   "text": "@前端 接口已完成…",
   "mentions": ["前端"],                             // 文本中 @ 到的 agent
-  "dispatch": ["前端"],                             // 真正需要响应的 agent（暂停或超出接力上限时为空）
+  "dispatch": ["前端"],                             // 真正需要响应的 agent（项目暂停时为空）
   "attachments": [{ "url": "/files/abc123/xxxx.png", "name": "shot.png", "size": 1234, "type": "image" }],
   "replyTo": "prev-id", "depth": 2, "ts": 1731400000000,
   "meta": { "kind": "ack-timeout", "agent": "前端", "ids": [...] }   // 类型：ack-timeout / ack-late / quota
 }
 ```
 
-agent 发消息时可带 `meta: { kind: "quota", until }`（额度用完通知）或 `{ kind: "quota-ok" }`，其他 meta 会被丢弃。
+agent 发消息时可带 `meta: { kind: "quota", until }`（额度用完通知）、`{ kind: "quota-ok" }`、`{ kind: "progress" }`（自动进展，不派活）、`{ kind: "ask" }`（需要用户确认，推送 Bark），其他 meta 会被丢弃。
+
+`hello` 可带 `cmd`（room 的命令名）：会话模式没有常驻连接时，`send` / `inbox` 等命令会把它标为工作中。`room wait` 断开后 150 秒内仍算在监听。
 
 ## 接单回执与超时
 
@@ -96,6 +101,6 @@ agent 发消息时可带 `meta: { kind: "quota", until }`（额度用完通知�
 | 4004 | 项目不存在或已删除 |
 | 4009 | 同名同模式的连接在别处上线，本连接被替换 |
 
-## 验收通知（Bark）
+## 手机推送（Bark）
 
-项目配置了 `barkUrl`（和可选的 `barkSound`，默认 `birdsong`）后，agent 消息里出现 `【待验收】` 时，服务端会把这条消息标成 `meta.kind = "review"`，并 POST 到 Bark：`{ title, body, sound, group, url, level }`。同一 agent 60 秒内最多推送一次。`barkUrl` 相当于推送密钥，不会通过 WebSocket 广播给 agent，只有管理员接口 `GET /api/projects/:id` 能读到。`POST /api/bark-test { projectId?, barkUrl?, barkSound? }` 用来测试推送。
+项目配置了 `barkUrl`（和可选的 `barkSound`，默认 `birdsong`）后，agent 消息满足以下之一时推送：含验收二维码链接（URL 含 `qrcode` / `qr-code` / `/qr/`，或"二维码"字样加图片链接、文件名含 qr 的图片附件）→ `meta.kind = "review"`、`meta.qr`；需要用户确认（`meta.kind = "ask"`，或 @用户昵称 且含问号）→ `meta.kind = "ask"`。POST 到 Bark：`{ title, body, sound, group, url, image, level }`。同一 agent 60 秒内最多推送一次，同一个二维码 6 小时内只推一次。`barkUrl` 相当于推送密钥，不会通过 WebSocket 广播给 agent，只有管理员接口 `GET /api/projects/:id` 能读到。`POST /api/bark-test { projectId?, barkUrl?, barkSound? }` 用来测试推送。

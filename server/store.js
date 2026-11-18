@@ -58,7 +58,7 @@ export class Store {
     });
   }
 
-  createProject({ name, description, workdir, agents, maxHops, ackTimeoutSec, barkUrl, barkSound }) {
+  createProject({ name, description, workdir, agents, ackTimeoutSec, barkUrl, barkSound }) {
     name = String(name || '').trim();
     if (!name) throw new Error('项目名称不能为空');
     const project = {
@@ -66,7 +66,6 @@ export class Store {
       name: name.slice(0, 80),
       description: String(description || '').trim().slice(0, 4000),
       workdir: String(workdir || '').trim(),
-      maxHops: clampInt(maxHops, 1, 100, 12),
       ackTimeoutSec: clampInt(ackTimeoutSec, 5, 3600, 60),
       paused: false,
       barkUrl: normBarkUrl(barkUrl),
@@ -85,7 +84,6 @@ export class Store {
     if (patch.name !== undefined) p.name = String(patch.name).trim().slice(0, 80) || p.name;
     if (patch.description !== undefined) p.description = String(patch.description).slice(0, 4000);
     if (patch.workdir !== undefined) p.workdir = String(patch.workdir).trim();
-    if (patch.maxHops !== undefined) p.maxHops = clampInt(patch.maxHops, 1, 100, p.maxHops);
     if (patch.ackTimeoutSec !== undefined) p.ackTimeoutSec = clampInt(patch.ackTimeoutSec, 5, 3600, p.ackTimeoutSec ?? 60);
     if (patch.paused !== undefined) p.paused = !!patch.paused;
     if (patch.barkUrl !== undefined) p.barkUrl = normBarkUrl(patch.barkUrl);
@@ -126,6 +124,18 @@ export class Store {
       this.messages.set(id, arr);
     }
     return this.messages.get(id);
+  }
+
+  /** 修改一条已有消息（撤回用）：内存里改，再整体重写该项目的消息文件 */
+  updateMessage(projectId, id, patch) {
+    const arr = this.getMessages(projectId);
+    const i = arr.findIndex((m) => m.id === id);
+    if (i < 0) return null;
+    arr[i] = { ...arr[i], ...patch };
+    const f = this.msgFile(projectId);
+    fs.writeFileSync(f + '.tmp', arr.map((m) => JSON.stringify(m)).join('\n') + '\n');
+    fs.renameSync(f + '.tmp', f);
+    return arr[i];
   }
 
   addMessage(projectId, msg) {

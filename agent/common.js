@@ -50,7 +50,11 @@ export function parseArgs(argv, repeatable = [], valueKeys = [], flags = []) {
   return out;
 }
 
-/** 连接配置：命令行 > 环境变量 > --config 文件 > 当前目录 .agent-room.json */
+/**
+ * 连接配置：命令行 > 环境变量 > --config / AGENT_ROOM_CONFIG 文件 > 当前目录 .agent-room.json
+ * 防串项目：配置文件属于别的项目或别的 agent 时，不拿它的 token 拼凑身份（同一台电脑上跑多个项目时，
+ * Codex 默认会过滤名字含 TOKEN 的环境变量，以前会退回到当前目录的 .agent-room.json，可能是另一个项目的）
+ */
 export function loadConn(args) {
   const env = process.env;
   let file = {};
@@ -58,11 +62,14 @@ export function loadConn(args) {
   try {
     file = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
   } catch {}
+  const project = args.project || env.AGENT_ROOM_PROJECT || file.project;
+  const agent = args.agent || env.AGENT_ROOM_AGENT || file.agent;
+  const fileMatches = (!file.project || file.project === project) && (!file.agent || file.agent === agent);
   return {
-    server: args.server || env.AGENT_ROOM_SERVER || file.server || 'ws://127.0.0.1:8787/ws',
-    project: args.project || env.AGENT_ROOM_PROJECT || file.project,
-    agent: args.agent || env.AGENT_ROOM_AGENT || file.agent,
-    token: args.token || env.AGENT_ROOM_TOKEN || file.token,
+    server: args.server || env.AGENT_ROOM_SERVER || (fileMatches ? file.server : '') || 'ws://127.0.0.1:8787/ws',
+    project,
+    agent,
+    token: args.token || env.AGENT_ROOM_TOKEN || (fileMatches ? file.token : undefined),
   };
 }
 
@@ -125,6 +132,7 @@ export function fmtTime(ts) {
   return new Date(ts).toLocaleString('zh-CN', { hour12: false });
 }
 export function fmtMessage(m, { base = '', maxLen = 3000, me = '' } = {}) {
+  if (m.recalled) return `[${fmtTime(m.ts)}] (id=${m.id}) ${m.fromType === 'user' ? m.from + '（用户）' : '@' + m.from}: （此消息已撤回，忽略它）`;
   const who = m.fromType === 'user' ? `${m.from}（用户）` : m.fromType === 'system' ? '系统' : `@${m.from}`;
   let text = m.text || '';
   if (maxLen && text.length > maxLen) {
@@ -136,15 +144,42 @@ export function fmtMessage(m, { base = '', maxLen = 3000, me = '' } = {}) {
 }
 
 // ---------- 一次性连接（room 工具用） ----------
+// room 当前执行的命令名，随 hello 发给服务端：会话模式在两次 room wait 之间用 send/inbox 等命令，说明它正在干活
+let clientCmd = '';
+export function setClientCmd(c) {
+  clientCmd = String(c || '').slice(0, 20);
+}
 /**
  * 连接并完成 hello，返回 { welcome, send, request, onMessage, close }
  * request(data) 会附带 clientId，等待服务端回执（sent/acked/error）
  */
-export function connectAgent(conn, { mode = 'tool', historyLimit = 100, onMessage, onClose, timeoutMs = 15000 } = {}) {
+export function connectAgent(conn, { mode = 'tool', historyLimit = 100, onMessage, onClose, timeoutMs = 15000, keepalive = false, info } = {}) {
   return new Promise((resolve, reject) => {
     const ws = new WS(conn.server);
     const waiters = new Map();
     let welcomed = false;
+    let closedFired = false;
+    const fireClose = (ev) => {
+      if (closedFired) return;
+      closedFired = true;
+      clearInterval(pinger);
+      onClose?.(ev);
+    };
+    // 长连接（room wait）做应用层心跳：网络断了但本地没察觉（电脑休眠、NAT 超时）时，
+    // 以前会一直"在监听"而服务端早已把它当离线；现在 70 秒收不到 pong 就当断线，由调用方重连
+    let lastPong = Date.now();
+    const pinger = keepalive
+      ? setInterval(() => {
+          if (!welcomed) return;
+          if (Date.now() - lastPong > 70_000) {
+            try {
+              ws.close();
+            } catch {}
+            return fireClose({ code: 4999, reason: 'heartbeat timeout' });
+          }
+          send({ type: 'ping' });
+        }, 25_000)
+      : null;
     const timer = setTimeout(() => {
       if (!welcomed) {
         try {
@@ -172,12 +207,16 @@ export function connectAgent(conn, { mode = 'tool', historyLimit = 100, onMessag
         send({ ...d, clientId });
       });
     ws.onopen = () =>
-      send({ type: 'hello', kind: 'agent', mode, caps: ['ack'], historyLimit, projectId: conn.project, agent: conn.agent, token: conn.token, host: os.hostname() });
+      send({ type: 'hello', kind: 'agent', mode, caps: ['ack', 'recall'], historyLimit, projectId: conn.project, agent: conn.agent, token: conn.token, host: os.hostname(), ...(info ? { info } : {}), ...(clientCmd ? { cmd: clientCmd } : {}) });
     ws.onmessage = (ev) => {
       let d;
       try {
         d = JSON.parse(typeof ev.data === 'string' ? ev.data : ev.data.toString());
       } catch {
+        return;
+      }
+      if (d.type === 'pong') {
+        lastPong = Date.now();
         return;
       }
       if (d.clientId && waiters.has(d.clientId)) {
@@ -188,7 +227,16 @@ export function connectAgent(conn, { mode = 'tool', historyLimit = 100, onMessag
       if (d.type === 'welcome' && !welcomed) {
         welcomed = true;
         clearTimeout(timer);
-        return resolve({ welcome: d, send, request, close: () => ws.close(), ws });
+        return resolve({
+          welcome: d,
+          send,
+          request,
+          close: () => {
+            clearInterval(pinger);
+            ws.close();
+          },
+          ws,
+        });
       }
       if (d.type === 'error' && !welcomed) {
         clearTimeout(timer);
@@ -199,10 +247,11 @@ export function connectAgent(conn, { mode = 'tool', historyLimit = 100, onMessag
     ws.onerror = () => {};
     ws.onclose = (ev) => {
       clearTimeout(timer);
+      clearInterval(pinger);
       if (!welcomed) reject(new Error(`连接被关闭 code=${ev.code} ${ev.reason || ''}`));
       for (const w of waiters.values()) w.rej(new Error('连接已关闭'));
       waiters.clear();
-      if (welcomed) onClose?.(ev);
+      if (welcomed) fireClose(ev);
     };
   });
 }
@@ -531,4 +580,46 @@ export function fmtUsage(u) {
   ]
     .filter(Boolean)
     .join('\n');
+}
+
+// ---------- 当前模型 ----------
+/** 从命令行参数里找 -m/--model 或 -c model=... */
+function modelFromArgs(extra = []) {
+  for (let i = 0; i < extra.length; i++) {
+    const a = extra[i];
+    if ((a === '-m' || a === '--model') && extra[i + 1]) return extra[i + 1];
+    const m = a.match(/^(?:--model=|model=)(.+)$/);
+    if (m) return m[1].replace(/^["']|["']$/g, '');
+    if (a === '-c' && /^model=/.test(extra[i + 1] || '')) return extra[i + 1].slice(6).replace(/^["']|["']$/g, '');
+  }
+  return '';
+}
+/** 读 TOML 顶层（第一个 [section] 之前）的字符串键 */
+function tomlTop(text, key) {
+  const top = text.split(/^\s*\[/m)[0];
+  const m = top.match(new RegExp('^\s*' + key + '\s*=\s*["\']([^"\']+)["\']', 'm'));
+  return m ? m[1] : '';
+}
+/**
+ * 推测 CLI 会用哪个模型：命令行指定 > CLI 配置文件 > 未知（用 CLI 默认）。
+ * 返回 { model, effort, source }；source = args | config | default
+ */
+export function detectModel(cli, { model = '', extra = [] } = {}) {
+  const fromArgs = model || modelFromArgs(extra);
+  if (cli === 'codex') {
+    let text = '';
+    try {
+      text = fs.readFileSync(path.join(codexHome(), 'config.toml'), 'utf8');
+    } catch {}
+    const effort = tomlTop(text, 'model_reasoning_effort');
+    if (fromArgs) return { model: fromArgs, effort, source: 'args' };
+    const m = tomlTop(text, 'model');
+    return m ? { model: m, effort, source: 'config' } : { model: '', effort, source: 'default' };
+  }
+  if (fromArgs) return { model: fromArgs, effort: '', source: 'args' };
+  if (process.env.ANTHROPIC_MODEL) return { model: process.env.ANTHROPIC_MODEL, effort: '', source: 'config' };
+  const dir = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude');
+  const st = readJsonFile(path.join(dir, 'settings.json'));
+  if (st?.model) return { model: st.model, effort: st.effortLevel || '', source: 'config' };
+  return { model: '', effort: '', source: 'default' };
 }

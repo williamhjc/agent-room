@@ -96,13 +96,13 @@ test('身份：非浏览器（无 Origin）或与 agent 同名的用户连接被
   assert.equal(fake.closeCode, 4002);
 });
 
-test('端到端：连接器接单回执 + agent 互相 @ 接力并受上限保护，无超时误报', async () => {
+test('端到端：连接器接单回执 + agent 互相 @ 接力不设上限（暂停可止住），无超时误报', async () => {
   const { project, tok } = await newProject(
     [
       { name: 'Alice', type: 'claude', role: '开发' },
       { name: 'Bob', type: 'codex', role: '测试' },
     ],
-    { maxHops: 3, ackTimeoutSec: 5 }
+    { ackTimeoutSec: 5 }
   );
   // 错误 token 被拒绝
   const bad = new WebSocket(WSURL);
@@ -122,8 +122,10 @@ test('端到端：连接器接单回执 + agent 互相 @ 接力并受上限保�
   assert.equal(a.depth, 1);
   assert.ok(a.replyTo);
   await waitFor(() => user.msgs.find((m) => m.from === 'Bob'));
-  await waitFor(() => user.msgs.find((m) => m.fromType === 'system' && m.text.includes('接力上限')), 15000);
-  assert.ok(user.msgs.every((m) => (m.depth || 0) <= 3));
+  // 以前的接力上限（12 轮）已移除：dry-run 回显里带着 @对方，会一直接力下去
+  await waitFor(() => user.msgs.find((m) => (m.depth || 0) >= 4), 20000);
+  await api(`/api/projects/${project.id}`, { method: 'PATCH', body: { paused: true } });
+  await waitFor(() => user.msgs.find((m) => m.fromType === 'system' && m.text.includes('暂停')));
   await sleep(6500); // 超过 ackTimeoutSec，确认没有误报
   assert.ok(!user.msgs.find((m) => m.meta?.kind === 'ack-timeout'), '连接器正常工作时不应出现超时提醒');
   await waitFor(() => user.presence.every((x) => x.pending === 0));
@@ -296,7 +298,115 @@ test('订阅额度：上报到成员状态；官方恢复时间很远但额度�
   user.ws.close();
 });
 
-test('验收通知：agent 发出【待验收】时推送 Bark，推送地址不外泄给 agent', async () => {
+test('长任务：工位显示正在做什么、定期在群里发进展（不派活）、显示模型；撤回正在处理的消息会停止任务', async () => {
+  const { project, tok } = await newProject([
+    { name: 'Alice', type: 'claude', role: '开发' },
+    { name: 'Bob', type: 'codex', role: '测试' },
+  ]);
+  const user = await userClient(project.id);
+  start(['agent/connector.js', '--server', WSURL, '--project', project.id, '--agent', 'Alice', '--token', tok.Alice, '--workdir', path.join(tmp, 'wd4'), '--dry-run', '--progress-interval', '0.03', '--model', 'claude-test-model']);
+  const alice = await waitFor(() => user.presence.find((a) => a.name === 'Alice' && a.online && a.info));
+  assert.equal(alice.info.model, 'claude-test-model');
+  assert.equal(alice.info.source, 'args');
+
+  user.say('@Alice [模拟耗时:4] 重构登录模块，顺便告诉 @Bob 一声');
+  await waitFor(() => user.presence.find((a) => a.name === 'Alice' && a.status === 'working' && a.workingSince));
+  const prog = await waitFor(() => user.msgs.find((m) => m.from === 'Alice' && m.meta?.kind === 'progress'), 8000);
+  assert.match(prog.text, /进展/);
+  assert.deepEqual(prog.dispatch, [], '进展消息不派活');
+  const done = await waitFor(() => user.msgs.find((m) => m.from === 'Alice' && !m.meta), 10000);
+  assert.match(done.text, /重构登录模块/);
+
+  // 撤回正在处理的消息：任务停止
+  user.say('@Alice [模拟耗时:30] 这条发错了');
+  const wrong = await waitFor(() => user.msgs.find((m) => m.text.includes('这条发错了') && m.fromType === 'user'));
+  await waitFor(() => user.presence.find((a) => a.name === 'Alice' && a.status === 'working'));
+  user.ws.send(JSON.stringify({ type: 'recall', id: wrong.id }));
+  await waitFor(() => user.msgs.find((m) => m.from === 'Alice' && /已被撤回/.test(m.text)), 8000);
+  await waitFor(() => user.presence.find((a) => a.name === 'Alice' && a.status === 'idle'));
+  const all = (await api(`/api/projects/${project.id}/messages`)).messages;
+  const r = all.find((m) => m.id === wrong.id);
+  assert.ok(r.recalled && r.text === '' && r.dispatch.length === 0, '撤回后内容清空、不再派发');
+
+  // 撤回还没人接单的消息：待接单清零；agent 只能撤回自己的消息
+  await sleep(300);
+  const before = user.presence.find((a) => a.name === 'Bob').pending;
+  user.say('@Bob 跑一下回归测试');
+  await waitFor(() => user.presence.find((a) => a.name === 'Bob' && a.pending === before + 1));
+  const toBob = await waitFor(() => user.msgs.find((m) => m.text === '@Bob 跑一下回归测试'));
+  user.ws.send(JSON.stringify({ type: 'recall', id: toBob.id }));
+  await waitFor(() => user.presence.find((a) => a.name === 'Bob' && a.pending === before));
+  const bad = start(['agent/room.js', 'recall', done.id], roomEnv(project, 'Bob', tok.Bob), { capture: true });
+  assert.notEqual(await exited(bad), 0);
+  assert.match(bad.out, /只能撤回自己/);
+  user.ws.close();
+});
+
+test('会话模式状态：wait 空档不算离线，干活中用 room 命令算工作中，发完言再 wait 才算空闲；room model 上报模型', async () => {
+  const { project, tok } = await newProject([{ name: 'Sess', type: 'claude', role: '开发' }]);
+  const user = await userClient(project.id);
+  const env = roomEnv(project, 'Sess', tok.Sess);
+  // wait 超时退出后的空档里仍显示在监听
+  assert.equal(await exited(start(['agent/room.js', 'wait', '--timeout', '1'], env)), 3);
+  await sleep(300);
+  let me = user.presence.find((a) => a.name === 'Sess');
+  assert.ok(me.online && me.listening && me.mode === 'session', JSON.stringify(me));
+  // 收到任务 → 工作中；中途 inbox / 后台再开 wait 都不打断"工作中"
+  const w = start(['agent/room.js', 'wait', '--timeout', '20'], env);
+  await waitFor(() => user.presence.find((a) => a.name === 'Sess' && a.status === 'idle' && a.listening));
+  user.say('@Sess 修一下首页');
+  assert.equal(await exited(w), 0);
+  await waitFor(() => user.presence.find((a) => a.name === 'Sess' && a.status === 'working'));
+  assert.equal(await exited(start(['agent/room.js', 'inbox'], env)), 0);
+  const bg = start(['agent/room.js', 'wait', '--timeout', '3'], env);
+  await sleep(800);
+  assert.equal(user.presence.find((a) => a.name === 'Sess').status, 'working', '开始干活后还没发言，后台 wait 不应变成空闲');
+  await exited(bg);
+  // 发完言再 wait → 空闲
+  assert.equal(await exited(start(['agent/room.js', 'send', '首页修好了'], env)), 0);
+  const w2 = start(['agent/room.js', 'wait', '--timeout', '2'], env);
+  await waitFor(() => user.presence.find((a) => a.name === 'Sess' && a.status === 'idle'));
+  await exited(w2);
+  // 模型
+  assert.equal(await exited(start(['agent/room.js', 'model', 'claude-opus-test', '--effort', 'high'], env)), 0);
+  me = await waitFor(() => user.presence.find((a) => a.name === 'Sess' && a.info?.model === 'claude-opus-test'));
+  assert.equal(me.info.effort, 'high');
+  assert.equal(me.info.source, 'self');
+  user.ws.close();
+});
+
+test('防串项目：token 环境变量被过滤时，不会拿当前目录里别的项目的 .agent-room.json 发消息', async () => {
+  const A = await newProject([{ name: 'Codex', type: 'codex' }]);
+  const B = await newProject([{ name: 'Codex', type: 'codex' }]);
+  const dir = path.join(tmp, 'mix');
+  fs.mkdirSync(dir, { recursive: true });
+  // 当前目录里放的是 B 项目的连接文件（比如以前在这里 room init 过）
+  fs.writeFileSync(path.join(dir, '.agent-room.json'), JSON.stringify({ server: WSURL, project: B.project.id, agent: 'Codex', token: B.tok.Codex }));
+  const run = (env) => {
+    const p = spawn(process.execPath, [path.resolve('agent/room.js'), 'send', '我是 A 项目的消息'], { cwd: dir, env: { ...childEnv, ...env }, stdio: ['ignore', 'pipe', 'pipe'] });
+    p.out = '';
+    p.stdout.on('data', (d) => (p.out += d));
+    p.stderr.on('data', (d) => (p.out += d));
+    procs.push(p);
+    return p;
+  };
+  // 连接器给 CLI 的环境：项目是 A，但 TOKEN 被 Codex 过滤掉了
+  const p1 = run({ AGENT_ROOM_SERVER: WSURL, AGENT_ROOM_PROJECT: A.project.id, AGENT_ROOM_AGENT: 'Codex' });
+  assert.notEqual(await exited(p1), 0);
+  assert.match(p1.out, /缺少 @Codex 的 token/);
+  // 有 AGENT_ROOM_CONFIG（连接器写的连接文件）时照常发到 A
+  const connFile = path.join(tmp, 'a-conn.json');
+  fs.writeFileSync(connFile, JSON.stringify({ server: WSURL, project: A.project.id, agent: 'Codex', token: A.tok.Codex }));
+  const p2 = run({ AGENT_ROOM_SERVER: WSURL, AGENT_ROOM_PROJECT: A.project.id, AGENT_ROOM_AGENT: 'Codex', AGENT_ROOM_CONFIG: connFile });
+  assert.equal(await exited(p2), 0);
+  assert.match(p2.out, /已发送到项目/);
+  const inA = (await api(`/api/projects/${A.project.id}/messages`)).messages;
+  const inB = (await api(`/api/projects/${B.project.id}/messages`)).messages;
+  assert.ok(inA.some((m) => m.text === '我是 A 项目的消息'));
+  assert.ok(!inB.some((m) => m.text === '我是 A 项目的消息'));
+});
+
+test('手机推送：只在给出验收二维码或需要用户确认时推送 Bark，推送地址不外泄给 agent', async () => {
   const http = await import('node:http');
   const got = [];
   const bark = http.createServer((req, res) => {
@@ -310,7 +420,7 @@ test('验收通知：agent 发出【待验收】时推送 Bark，推送地址不
   });
   await new Promise((r) => bark.listen(0, '127.0.0.1', r));
   const barkUrl = `http://127.0.0.1:${bark.address().port}/KEY123/`;
-  const { project, tok } = await newProject([{ name: 'Dev', type: 'claude' }], { barkUrl });
+  const { project, tok } = await newProject([{ name: 'Dev', type: 'claude' }, { name: 'QA', type: 'codex' }, { name: 'PM', type: 'claude' }], { barkUrl });
   assert.equal(project.barkUrl, barkUrl.replace(/\/$/, ''));
   assert.equal(project.barkSound, 'birdsong');
 
@@ -324,19 +434,37 @@ test('验收通知：agent 发出【待验收】时推送 Bark，推送地址不
   await exited(w);
   const user = await userClient(project.id);
   await sleep(200);
-  // 普通消息不推送；--review 推送
+  const say = (who, ...argv) => exited(start(['agent/room.js', 'send', ...argv], roomEnv(project, who, tok[who])));
+  // 普通进度、只写了【待验收】字样的消息都不推送
   const n0 = got.length;
-  assert.equal(await exited(start(['agent/room.js', 'send', '进度：接口写了一半'], roomEnv(project, 'Dev', tok.Dev))), 0);
-  assert.equal(await exited(start(['agent/room.js', 'send', '--review', '登录功能已完成，打开 /login 用 test/test 登录'], roomEnv(project, 'Dev', tok.Dev))), 0);
-  await waitFor(() => got.length > n0);
+  assert.equal(await say('Dev', '进度：接口写了一半'), 0);
+  assert.equal(await say('Dev', '【待验收】@QA 登录接口好了，请测试'), 0);
+  assert.equal(await say('Dev', '@用户 同步一下：今天完成了登录'), 0);
+  await sleep(500);
+  assert.equal(got.length, n0, '普通消息、【待验收】字样、不提问的 @用户 都不推送');
+  // ① 需要用户确认（--ask）
+  assert.equal(await say('Dev', '--ask', '登录页要不要加验证码？我建议先不加'), 0);
+  await waitFor(() => got.length === n0 + 1);
+  assert.match(got.at(-1).body.title, /需要你确认/);
+  assert.match(got.at(-1).body.body, /@Dev：登录页要不要加验证码/);
+  assert.equal(got.at(-1).body.sound, 'birdsong');
+  assert.ok(user.msgs.find((m) => m.from === 'Dev' && m.meta?.kind === 'ask'));
+  // ② 给出验收二维码链接
+  const qr = 'https://tapcode.example.com/qrcode/m_abc_123.png';
+  assert.equal(await say('QA', `测试包已上传，扫码验收：
+${qr}`), 0);
+  await waitFor(() => got.length === n0 + 2);
+  assert.match(got.at(-1).body.title, /可以验收了/);
+  assert.equal(got.at(-1).body.image, qr);
+  assert.ok(!got.at(-1).body.body.includes('http'), '正文里不放长链接');
+  assert.ok(user.msgs.find((m) => m.from === 'QA' && m.meta?.kind === 'review' && m.meta.qr === qr));
+  // ③ @用户 并提问也算需要确认；同一个二维码被别人转发不重复推送
+  assert.equal(await say('PM', `二维码在这：${qr}`), 0);
+  assert.equal(await say('PM', '@用户 首页配色用蓝色还是绿色？'), 0);
+  await waitFor(() => got.length === n0 + 3);
   await sleep(300);
-  assert.equal(got.length, n0 + 1, '只有待验收消息会推送');
-  const push = got.at(-1).body;
-  assert.match(push.title, /待验收/);
-  assert.match(push.body, /@Dev：登录功能已完成/);
-  assert.equal(push.sound, 'birdsong');
-  const msg = user.msgs.find((m) => m.meta?.kind === 'review');
-  assert.ok(msg && msg.text.startsWith('【待验收】'));
+  assert.equal(got.length, n0 + 3, '转发的同一个二维码不重复推送');
+  assert.match(got.at(-1).body.body, /配色/);
   const { normBarkUrl } = await import('../server/store.js');
   assert.equal(normBarkUrl('https://api.day.app/abc/这里改成你自己的推送内容'), 'https://api.day.app/abc');
   user.ws.close();
