@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // Agent Room 连接器：把本机的 Claude Code / Codex CLI 作为一个 agent 接入 room。
-// 常驻监听；被 @ 时在项目工作目录里调用 CLI 完成任务，只把最终回复发到群里（不转发思考/执行过程）。
+// 常驻监听；被 @ 时在项目工作目录里调用 CLI 完成任务，把最终回复发到群里；
+// 思考和执行过程实时发给服务端，只显示在网页工位卡片上（不进群聊记录）。
 //
 // 用法：
 //   node agent/connector.js --server ws://HOST:8787/ws --project <ID> --agent <名称> --token <TOKEN> \
@@ -12,7 +13,26 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { WS, parseArgs, loadConn, httpBase, stateDir, readState, updateState, fmtMessage, ensureRoomShim, detectLimit, looksLikeLimitResult, fetchUsage, fmtUsage, detectModel } from './common.js';
+import {
+  WS,
+  parseArgs,
+  loadConn,
+  httpBase,
+  stateDir,
+  readState,
+  updateState,
+  fmtMessage,
+  ensureRoomShim,
+  detectLimit,
+  looksLikeLimitResult,
+  fetchUsage,
+  fmtUsage,
+  detectModel,
+  describeTool,
+  claudeActivity,
+  makeCodexActivity,
+  activitySender,
+} from './common.js';
 
 const ROOM_TOOL = path.join(path.dirname(fileURLToPath(import.meta.url)), 'room.js');
 const SHIM_DIR = ensureRoomShim(ROOM_TOOL); // 提供 `room` 短命令给 CLI 子进程
@@ -76,6 +96,7 @@ let currentTriggers = [];
 let runNote = '';
 let backoff = 1000;
 let lastPong = Date.now();
+let welcomedOnce = false;
 // 额度用完：state.limited = { until, guessed, reason, since, ids, notified }，持久化，重启后继续等
 let limitTimer = null;
 
@@ -141,6 +162,9 @@ function onServer(data) {
       history = data.history || [];
       log(`已加入项目「${project.name}」，角色：${self.type} — ${self.role.slice(0, 60) || '（未定义）'}`);
       log(`工作目录：${cfg.workdir}`);
+      if (!welcomedOnce) activity.push({ kind: 'sys', text: `连接器已启动（${os.hostname()} · ${cfg.workdir}）` });
+      welcomedOnce = true;
+      activity.flush();
       // 补处理：服务端记录的未接单派发 + 已处理游标之后 1 小时内 @ 我的消息
       const pendIds = new Set([...(data.pending || []), ...(state.limited?.ids || [])]);
       const doneTs = state.doneTs || 0;
@@ -234,6 +258,10 @@ function onServer(data) {
       }
       return;
     case 'error':
+      if (/未知消息类型：activity/.test(data.error || '')) {
+        activityOff = true; // 旧版服务端：不再发执行过程
+        return;
+      }
       log('服务端错误：', data.error);
       return;
   }
@@ -265,6 +293,11 @@ async function pump() {
   send({ type: 'ack', ids: triggers.map((m) => m.id) });
   runNote = `处理 ${last.from} 的消息`;
   actReset();
+  codexAct = makeCodexActivity();
+  activity.push([
+    { kind: 'sys', text: `开始处理 ${triggers.length > 1 ? `${triggers.length} 条消息（最新来自 ${last.from}）` : `${last.from} 的消息`}` },
+    { kind: 'input', text: `${last.from}：${String(last.text || '').slice(0, 500)}` },
+  ]);
   setStatus('working', workingNote());
   const prompt = buildPrompt(triggers);
   const runStart = Date.now();
@@ -285,16 +318,20 @@ async function pump() {
       running = null;
       currentTriggers = [];
       pending = [...triggers, ...pending.filter((m) => !triggers.includes(m))];
+      activity.push({ kind: 'err', text: `模型额度用完 / 限流：${e.limit.text}，任务已排队，恢复后自动重试` });
       enterLimit(e.limit, triggers);
       return;
     }
     log('执行失败：', e.message);
+    activity.push({ kind: e.cancelled && !e.timedOut ? 'sys' : 'err', text: e.cancelled && !e.timedOut ? '任务已中止' : `执行失败：${e.message.slice(0, 500)}` });
     if (e.timedOut) {
       reply = `⚠️ 这次任务执行超过 ${fmtDuration(cfg.timeoutMin * 60_000)}，被连接器终止（--timeout 上限），结果可能不完整。需要继续请再 @我（会接着上次的会话），或调大连接器的 --timeout（0 为不限制）。`;
     } else if (e.cancelled) reply = running?.recalled ? '（对应的消息已被撤回，任务已停止）' : null;
     else reply = `⚠️ 执行出错：${e.message.slice(0, 1500)}`;
   }
   if (reply !== null) post(reply.trim() || '（无输出）', last.id);
+  activity.push({ kind: 'end', text: `本轮结束，用时 ${fmtDuration(Date.now() - runStart)}${reply !== null ? '，已回复到群里' : ''}` });
+  activity.flush();
   saveState({ doneTs: last.ts, lastRunEnd: Date.now() });
   running = null;
   act = null;
@@ -333,33 +370,17 @@ function noteAction(action = '', text = '') {
     if (running && act) setStatus('working', workingNote());
   }, 3000);
 }
-function describeTool(name, i = {}) {
-  const base = (p) => (p ? path.basename(String(p)) : '');
-  switch (name) {
-    case 'Bash':
-    case 'PowerShell':
-      return `运行 ${short(i.command, 70)}`;
-    case 'Edit':
-    case 'MultiEdit':
-    case 'Write':
-    case 'NotebookEdit':
-      return `编辑 ${base(i.file_path || i.notebook_path)}`;
-    case 'Read':
-      return `查看 ${base(i.file_path)}`;
-    case 'Grep':
-    case 'Glob':
-      return `搜索 ${short(i.pattern, 40)}`;
-    case 'WebFetch':
-    case 'WebSearch':
-      return `查资料 ${short(i.query || i.url, 50)}`;
-    case 'Task':
-    case 'Agent':
-      return `派子任务 ${short(i.description, 40)}`;
-    default:
-      return `调用 ${name}`;
-  }
-}
+// 执行过程（思考 / 工具调用 / 输出）：实时发给服务端，显示在网页工位卡片上
+let activityOff = false; // 旧版服务端不认识 activity 消息
+const activity = activitySender((d) => {
+  if (activityOff) return true;
+  if (!ws || ws.readyState !== 1) return false;
+  ws.send(JSON.stringify(d));
+  return true;
+});
+let codexAct = makeCodexActivity();
 function onClaudeEvent(ev) {
+  activity.push(claudeActivity(ev));
   if (ev.type === 'system' && ev.subtype === 'init' && ev.model) setModel(ev.model, 'cli');
   if (ev.type === 'assistant') {
     for (const c of ev.message?.content || []) {
@@ -372,6 +393,7 @@ function onClaudeEvent(ev) {
   } else noteAction();
 }
 function onCodexEvent(ev) {
+  activity.push(codexAct(ev));
   const it = ev.item || {};
   const old = ev.msg || {}; // 旧版事件格式
   const t = it.type || it.item_type;
@@ -741,6 +763,7 @@ function exec(bin, argv, input, { onEvent, keep } = {}) {
         AGENT_ROOM_TOKEN: cfg.token,
         AGENT_ROOM_CONFIG: CONN_FILE, // token 被过滤时 room 从这里读，不会退回到别的项目的配置
         AGENT_ROOM_TOOL: ROOM_TOOL,
+        AGENT_ROOM_CONNECTOR: '1', // room 看到它就不再起会话监视进程（执行过程由连接器上报）
         [pathKey]: SHIM_DIR + path.delimiter + (process.env[pathKey] || ''),
       },
       windowsHide: true,
@@ -790,9 +813,14 @@ function exec(bin, argv, input, { onEvent, keep } = {}) {
       clearTimeout(timer);
       reject(new Error(`无法启动 ${bin}：${e.message}`));
     });
-    child.on('close', (code) => {
+    child.on('close', (code, signal) => {
       clearTimeout(timer);
       if (partial) handleLine(partial);
+      // CLI 异常退出（被系统杀掉、内存不足、崩溃）：在执行过程里标出来，网页上能看到
+      if (!running?.cancelled && (code || signal)) {
+        const tail = stderr.trim().split('\n').slice(-3).join('\n').slice(-400);
+        activity.push({ kind: 'err', text: `${path.basename(bin)} 进程退出（${signal ? `信号 ${signal}` : `退出码 ${code}`}）${tail ? `：${tail}` : ''}` });
+      }
       if (running?.cancelled) {
         const err = new Error(running.timedOut ? '执行超时' : '已中止');
         err.cancelled = true;
@@ -874,6 +902,7 @@ async function runClaude(prompt, allowResume = true) {
   if (!out) {
     if (resume) {
       log('续接会话失败，改用新会话重试');
+      activity.push({ kind: 'sys', text: '续接上次的会话失败，改用新会话重试（之前的上下文丢失）' });
       saveState({ sessionId: null, primed: false });
       return runClaude(buildPrompt(currentTriggers), false);
     }
@@ -928,6 +957,7 @@ async function runCodex(prompt, allowResume = true) {
   if (code !== 0 && !result.trim()) {
     if (resume) {
       log('续接会话失败，改用新会话重试');
+      activity.push({ kind: 'sys', text: '续接上次的会话失败，改用新会话重试（之前的上下文丢失）' });
       saveState({ sessionId: null, primed: false });
       return runCodex(buildPrompt(currentTriggers), false);
     }
@@ -937,10 +967,15 @@ async function runCodex(prompt, allowResume = true) {
   return result;
 }
 
-process.on('SIGINT', () => {
+// 手动停止：先告诉服务端，群里就不会当成"连接器掉线"报警（被系统强杀时来不及发，会报警）
+function shutdown(sig) {
   log('退出');
   killRunning();
-  process.exit(0);
-});
+  activity.flush();
+  send({ type: 'bye', reason: sig === 'SIGINT' ? '手动停止' : `收到 ${sig}` });
+  setTimeout(() => process.exit(0), 300);
+}
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
 
 connect();

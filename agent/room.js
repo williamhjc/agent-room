@@ -13,9 +13,34 @@
 //   node room.js model "模型名" [--effort high]  告诉群里你当前用的模型（会话模式用）
 //   node room.js recall <消息id>          撤回自己发的消息
 //   node room.js get <附件URL> [-o 文件]  下载附件
+//
+// 会话模式下 room wait / send 会顺带在后台启动一个监视进程（每个会话一个）：把会话窗口里的思考和执行过程
+// 实时显示到网页工位卡片上；CLI 进程退出（被关掉、内存不足被系统结束）时马上通知群里。设 AGENT_ROOM_NO_WATCH=1 关闭
 import fs from 'node:fs';
 import path from 'node:path';
-import { parseArgs, loadConn, connectAgent, readState, updateState, fmtMessage, httpBase, uploadFile, fetchUsage, fmtUsage, detectModel, setClientCmd } from './common.js';
+import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import {
+  parseArgs,
+  loadConn,
+  connectAgent,
+  readState,
+  updateState,
+  fmtMessage,
+  httpBase,
+  uploadFile,
+  fetchUsage,
+  fmtUsage,
+  detectModel,
+  setClientCmd,
+  stateDir,
+  pidAlive,
+  findCliProcess,
+  findTranscript,
+  claudeActivity,
+  makeCodexActivity,
+  activitySender,
+} from './common.js';
 
 const argv = process.argv.slice(2);
 const cmd = argv[0] && !argv[0].startsWith('--') ? argv.shift() : 'help';
@@ -84,6 +109,7 @@ const commands = {
 
   async wait() {
     need();
+    ensureWatcher();
     const timeoutSec = parseFloat(args.timeout ?? '600');
     const deadline = timeoutSec > 0 ? Date.now() + timeoutSec * 1000 : Infinity;
     const timeoutExit = () => {
@@ -188,6 +214,7 @@ const commands = {
 
   async send() {
     need();
+    ensureWatcher();
     let text = args._.join(' ');
     if (args.file) text = fs.readFileSync(args.file, 'utf8');
     if (args.stdin || (!text && !args.attach)) text = (await readStdin()) || text;
@@ -294,8 +321,209 @@ const commands = {
   },
 };
 
+// ---------- 会话监视进程 ----------
+const ROOM_JS = fileURLToPath(import.meta.url);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const watchLockFile = () => path.join(stateDir, `${conn.project}-${String(conn.agent).replace(/[^\w-]/g, '_')}.watch.json`);
+function readLock() {
+  try {
+    return JSON.parse(fs.readFileSync(watchLockFile(), 'utf8'));
+  } catch {
+    return null;
+  }
+}
+function writeLock(d) {
+  try {
+    fs.mkdirSync(stateDir, { recursive: true });
+    fs.writeFileSync(watchLockFile(), JSON.stringify(d));
+  } catch {}
+}
+/** 会话模式：确保有一个后台监视进程盯着当前会话。已经有了就立即返回 */
+function ensureWatcher() {
+  const env = process.env;
+  // 连接器启动的 CLI（会带 AGENT_ROOM_TOOL）：连接器自己会上报执行过程
+  if (env.AGENT_ROOM_CONNECTOR || env.AGENT_ROOM_TOOL || env.AGENT_ROOM_NO_WATCH === '1') return;
+  try {
+    const lock = readLock();
+    const sess = env.CLAUDECODE ? env.CLAUDE_CODE_SESSION_ID || '' : '';
+    if (lock?.pid && pidAlive(lock.pid) && lock.cliPid && pidAlive(lock.cliPid) && (!sess || lock.session === sess) && (!+env.CLAUDE_PID || +env.CLAUDE_PID === lock.cliPid)) return;
+    if (lock?.launching && Date.now() - lock.launching < 15_000) return;
+    // 不在 Claude Code / Codex 里运行（脚本、普通终端）：同一个父进程 10 分钟内不再查进程树
+    if (lock?.noCli && Date.now() - lock.at < 10 * 60_000 && lock.ppid === process.ppid) return;
+    const cli = findCliProcess();
+    if (!cli) return writeLock({ noCli: true, at: Date.now(), ppid: process.ppid });
+    writeLock({ pid: 0, launching: Date.now(), cli: cli.cli, cliPid: cli.pid, session: cli.session });
+    const argv = [ROOM_JS, '_watch-launch', '--cli', cli.cli, '--cli-pid', String(cli.pid), '--cwd', process.cwd()];
+    if (cli.session) argv.push('--session', cli.session);
+    // 连接信息走环境变量（不放命令行，免得 token 出现在进程列表里）
+    const childEnv = { ...env, AGENT_ROOM_SERVER: conn.server, AGENT_ROOM_PROJECT: conn.project, AGENT_ROOM_AGENT: conn.agent, AGENT_ROOM_TOKEN: conn.token };
+    spawn(process.execPath, argv, { detached: true, stdio: 'ignore', windowsHide: true, env: childEnv }).unref();
+  } catch {}
+}
+
+const watchCommands = {
+  /** 再起一层就退出：监视进程不挂在 CLI 的进程树下，CLI 按进程树清理工具调用时不会把它一起杀掉 */
+  async '_watch-launch'() {
+    spawn(process.execPath, [ROOM_JS, '_watch', ...process.argv.slice(3)], { detached: true, stdio: 'ignore', windowsHide: true, env: process.env }).unref();
+  },
+
+  /** 监视进程本体：同步会话记录到网页；CLI 进程退出时通知服务端 */
+  async _watch() {
+    need();
+    const cli = args.cli === 'codex' ? 'codex' : 'claude';
+    const cliName = cli === 'codex' ? 'Codex' : 'Claude Code';
+    const cliPid = parseInt(args['cli-pid'], 10) || 0;
+    const session = typeof args.session === 'string' ? args.session : '';
+    const cwd = typeof args.cwd === 'string' ? args.cwd : process.cwd();
+    writeLock({ pid: process.pid, cli, cliPid, session, startedAt: Date.now() });
+    let c = null;
+    let stopping = false;
+    const sender = activitySender((d) => (c ? c.send(d) : false));
+    const toAct = cli === 'codex' ? makeCodexActivity() : claudeActivity;
+    const exit = (code = 0) => {
+      if (readLock()?.pid === process.pid) fs.rmSync(watchLockFile(), { force: true });
+      process.exit(code);
+    };
+
+    // 增量读取会话记录（jsonl，一行一个事件）
+    let file = null;
+    let offset = 0;
+    let rest = Buffer.alloc(0);
+    let skipPartial = false;
+    const openFile = (f) => {
+      file = f;
+      rest = Buffer.alloc(0);
+      let size = 0;
+      try {
+        size = fs.statSync(f).size;
+      } catch {}
+      offset = Math.max(0, size - 96 * 1024); // 带上最近的一小段，网页一打开就有上下文
+      skipPartial = offset > 0;
+    };
+    const readNew = () => {
+      let size;
+      try {
+        size = fs.statSync(file).size;
+      } catch {
+        return [];
+      }
+      if (size < offset) {
+        offset = 0; // 文件被重写
+        rest = Buffer.alloc(0);
+      }
+      if (size === offset) return [];
+      const len = Math.min(size - offset, 8 << 20);
+      const buf = Buffer.alloc(len);
+      let n = 0;
+      try {
+        const fd = fs.openSync(file, 'r');
+        n = fs.readSync(fd, buf, 0, len, offset);
+        fs.closeSync(fd);
+      } catch {
+        return [];
+      }
+      offset += n;
+      const data = Buffer.concat([rest, buf.subarray(0, n)]);
+      const nl = data.lastIndexOf(10);
+      if (nl < 0) {
+        rest = data.length > 32 << 20 ? Buffer.alloc(0) : data;
+        return [];
+      }
+      rest = data.subarray(nl + 1);
+      const lines = data.subarray(0, nl).toString('utf8').split('\n');
+      if (skipPartial) {
+        lines.shift();
+        skipPartial = false;
+      }
+      const evs = [];
+      for (const l of lines) {
+        const t = l.trim();
+        if (!t.startsWith('{')) continue;
+        try {
+          evs.push(...toAct(JSON.parse(t)));
+        } catch {}
+      }
+      return evs;
+    };
+
+    // 与服务端的连接：断线自动重连；被新的监视进程替换（4009）或 agent 被删除时退出
+    (async () => {
+      let backoff = 1000;
+      while (!stopping) {
+        try {
+          let onClosed;
+          const closed = new Promise((r) => (onClosed = r));
+          const cc = await connectAgent(conn, { mode: 'watch', historyLimit: 1, keepalive: true, onClose: (ev) => onClosed(ev) });
+          if (cc.welcome.mode !== 'watch') {
+            cc.close(); // 旧版服务端不认识 watch 连接
+            exit(0);
+          }
+          c = cc;
+          backoff = 1000;
+          c.send({ type: 'session', state: 'alive', cli, pid: cliPid, transcript: file ? path.basename(file) : '' });
+          sender.flush();
+          const ev = await closed;
+          c = null;
+          if (!stopping && [4003, 4004, 4009].includes(ev.code)) exit(0);
+        } catch (e) {
+          if (/code=40(03|04|09)|token|不存在|不正确/.test(e.message)) exit(1);
+        }
+        await sleep(backoff);
+        backoff = Math.min(backoff * 2, 30_000);
+      }
+    })();
+
+    const ended = async () => {
+      stopping = true;
+      sender.flush();
+      const reason = `${cliName} 进程（pid ${cliPid}）已退出`;
+      for (let i = 0; i < 5; i++) {
+        try {
+          const cc = c || (await connectAgent(conn, { mode: 'watch', historyLimit: 1 }));
+          await cc.request({ type: 'session', state: 'ended', reason, cli });
+          cc.close();
+          break;
+        } catch {
+          await sleep(3000);
+        }
+      }
+      exit(0);
+    };
+
+    const startedAt = Date.now();
+    let lastFind = 0;
+    let lastAlive = 0;
+    let warnedNoFile = false;
+    for (;;) {
+      await sleep(1000);
+      const l = readLock();
+      if (l?.pid && l.pid !== process.pid) exit(0); // 别的监视进程接手了
+      // 找会话记录；Codex 没有会话 id 时每 30 秒看一下有没有换成新的会话文件（/new 之类）
+      if (!file || (cli === 'codex' && !session && Date.now() - lastFind > 30_000)) {
+        lastFind = Date.now();
+        const f = findTranscript(cli, { session, cwd });
+        if (f && f !== file) {
+          const first = !file;
+          openFile(f);
+          const evs = readNew();
+          sender.push(first ? evs.filter((e) => e.kind !== 'think' || e.text).slice(-30) : evs);
+          sender.push({ kind: 'sys', text: `已连上 ${cliName} 会话，实时同步思考和执行过程` });
+        } else if (!f && !warnedNoFile && Date.now() - startedAt > 60_000) {
+          warnedNoFile = true;
+          sender.push({ kind: 'sys', text: `没找到 ${cliName} 的会话记录，只能检测会话进程是否退出` });
+        }
+      }
+      if (file) sender.push(readNew());
+      if (cliPid && Date.now() - lastAlive > 3000) {
+        lastAlive = Date.now();
+        if (pidAlive(cliPid) === false) await ended();
+      }
+    }
+  },
+};
+
 const waitOnce = (deadline) => commands._waitOnceBody(deadline);
-const fn = cmd.startsWith('_') ? null : commands[cmd];
+const fn = watchCommands[cmd] || (cmd.startsWith('_') ? null : commands[cmd]);
 setClientCmd(cmd);
 if (!fn) die(`未知命令：${cmd}\n运行 room help 查看用法`);
 fn().catch((e) => die('错误：' + e.message));

@@ -1,5 +1,5 @@
 // Agent Room 网页端
-import { headIcon, sceneSVG, sceneState, sceneCaption, untilText } from './scenes.js';
+import { headIcon, liveState, liveCaption, untilText } from './status.js';
 const $ = (s) => document.querySelector(s);
 const TOUCH = matchMedia('(pointer: coarse)').matches;
 const esc = (s) =>
@@ -25,6 +25,8 @@ const S = {
   projects: [],
   current: null, // 完整项目（含 token）
   presence: [],
+  activity: new Map(), // agent -> 最近的执行过程 [{ts, kind, text}]
+  lastOut: new Map(), // agent -> 最近一次有执行过程输出的时间
   messages: [],
   hasMore: false,
   ws: null,
@@ -120,6 +122,10 @@ async function openProject(id) {
   $('#emptyState').classList.add('hidden');
   for (const s of ['#chatHead', '#messages', '#composer', '#members']) $(s).classList.remove('hidden');
   $('#app').classList.remove('no-members');
+  if (S.wsProject !== id) {
+    S.activity = new Map(); // 换项目：执行过程等 welcome 带过来
+    S.lastOut = new Map();
+  }
   renderHeader();
   renderMembers();
   renderChips();
@@ -182,10 +188,23 @@ function onWs(d) {
       S.messages = d.history;
       S.hasMore = d.hasMore;
       S.presence = d.presence;
+      S.activity = new Map(Object.entries(d.activity || {}));
+      S.lastOut = new Map();
+      memberListKey = ''; // 重建工位卡片，带上执行过程
       renderMessages(true);
       renderMembers();
       renderWorking();
       break;
+    case 'activity': {
+      const list = S.activity.get(d.agent) || [];
+      list.push(...d.events);
+      if (list.length > 300) list.splice(0, list.length - 300);
+      S.activity.set(d.agent, list);
+      if (d.lastOutputAt) S.lastOut.set(d.agent, d.lastOutputAt);
+      appendActivity(d.agent, d.events);
+      updateAges();
+      break;
+    }
     case 'message': {
       const atBottom = isAtBottom();
       S.messages.push(d.message);
@@ -433,15 +452,80 @@ function renderWorking() {
   const bar = $('#workingBar');
   bar.classList.toggle('hidden', !w.length);
   bar.innerHTML = w
-    .map((a) => `<span class="w"><span class="mini">${headIcon(a.type)}</span><span class="dots"><i></i><i></i><i></i></span>@${esc(a.name)} 正在搬砖${a.note ? `（${esc(a.note)}）` : ''}</span>`)
+    .map((a) => `<span class="w"><span class="mini">${headIcon(a.type)}</span><span class="dots"><i></i><i></i><i></i></span>@${esc(a.name)} 正在工作${a.note ? `（${esc(a.note)}）` : ''}</span>`)
     .join('');
 }
 
 // ---------- 成员面板 ----------
 const STATUS_TEXT = { offline: '离线', idle: '在线 · 空闲', working: '工作中', error: '出错', quota: '额度用完 · 等待恢复' };
 const MODE_TEXT = { connector: '连接器', session: '交互会话' };
-// 卡片按 agent 复用；场景 SVG 只在状态变化时替换，避免每次在线状态更新都让动画重播
-const memberCards = new Map(); // name -> { el, sceneKey }
+// ---------- 执行过程面板：实时显示 agent 的思考、工具调用和输出 ----------
+const ACT_ICON = { think: '💭', say: '💬', tool: '▶', out: '↳', err: '✖', input: '📨', sys: '•', end: '⏹' };
+const ACT_MAX_LINES = 300;
+function hms(t) {
+  return new Date(t).toLocaleTimeString('zh-CN', { hour12: false });
+}
+function actLine(e) {
+  const el = document.createElement('div');
+  const text = e.text || (e.kind === 'think' ? '思考中…' : '');
+  el.className = `ln k-${e.kind}${e.kind === 'think' && !e.text ? ' pending' : ''}${text.length > 140 || text.includes('\n') ? ' long' : ''}`;
+  el.innerHTML = `<span class="lt">${hms(e.ts)}</span><span class="li">${ACT_ICON[e.kind] || '•'}</span><span class="lx">${esc(text)}</span>`;
+  return el;
+}
+function liveEmptyHTML() {
+  return `<div class="live-empty">还没有执行过程。接到任务后，这里会实时显示它的思考、运行的命令和输出。<br>交互会话：重新下载一次 agent 工具，运行 room wait 时会自动开始同步。</div>`;
+}
+/** 往某个 agent 的面板追加执行过程；用户往上翻看时不自动滚到底 */
+function appendActivity(name, events, initial = false) {
+  const card = memberCards.get(name);
+  if (!card || !events.length) return;
+  const log = card.el.querySelector('.live-log');
+  const stick = initial || log.scrollHeight - log.scrollTop - log.clientHeight < 40;
+  log.querySelector('.live-empty')?.remove();
+  const frag = document.createDocumentFragment();
+  for (const e of events) {
+    // "思考中"占位只保留在最后一行
+    const last = frag.lastChild || log.lastElementChild;
+    if (last?.classList?.contains('pending')) last.remove();
+    frag.appendChild(actLine(e));
+  }
+  log.appendChild(frag);
+  while (log.childElementCount > ACT_MAX_LINES) log.firstElementChild.remove();
+  if (stick) log.scrollTop = log.scrollHeight;
+}
+function agoText(t) {
+  const s = Math.max(0, Math.round((Date.now() - t) / 1000));
+  if (s < 60) return `${s} 秒前`;
+  const m = Math.floor(s / 60);
+  return m < 60 ? `${m} 分钟前` : `${Math.floor(m / 60)} 小时 ${m % 60} 分前`;
+}
+/** 面板右上角："12 秒前有输出"；干活时太久没输出变黄 / 变红，方便判断是不是卡住了 */
+function updateAges() {
+  const pres = new Map(S.presence.map((a) => [a.name, a]));
+  for (const [name, card] of memberCards) {
+    const st = pres.get(name) || {};
+    const t = Math.max(S.lastOut.get(name) || 0, st.lastOutputAt || 0);
+    const el = card.el.querySelector('.live-age');
+    let cls = '';
+    let text = t ? `${agoText(t)}有输出` : '';
+    if (liveState(st) === 'working' && t) {
+      const min = (Date.now() - t) / 60_000;
+      if (min >= 15) {
+        cls = 'bad';
+        text = `已 ${Math.floor(min)} 分钟没有任何输出，可能卡住了`;
+      } else if (min >= 3) {
+        cls = 'warn';
+        text = `已 ${Math.floor(min)} 分钟没有新输出`;
+      }
+    }
+    el.className = `live-age ${cls}`;
+    el.textContent = text;
+  }
+}
+setInterval(() => S.current && updateAges(), 5000);
+
+// 卡片按 agent 复用：执行过程只追加，不随在线状态更新重建
+const memberCards = new Map(); // name -> { el }
 let memberListKey = '';
 function renderMembers() {
   const p = S.current;
@@ -456,8 +540,14 @@ function renderMembers() {
       const el = document.createElement('div');
       el.className = 'member';
       el.innerHTML = `
-        <div class="stage"><div class="stage-scene"></div></div>
-        <div class="stage-caption"></div>
+        <div class="live">
+          <div class="live-head">
+            <span class="live-cap"></span>
+            <span class="live-age"></span>
+            <button class="live-size" data-act="size" title="放大 / 缩小执行过程">⤢</button>
+          </div>
+          <div class="live-log">${liveEmptyHTML()}</div>
+        </div>
         <div class="member-info">
           <div class="member-top">
             <div class="avatar ${a.type}">${headIcon(a.type)}<span class="status-dot"></span></div>
@@ -471,23 +561,19 @@ function renderMembers() {
           <div class="member-actions"></div>
         </div>`;
       box.appendChild(el);
-      memberCards.set(a.name, { el, sceneKey: '' });
+      memberCards.set(a.name, { el });
+      appendActivity(a.name, S.activity.get(a.name) || [], true);
     }
   }
   const pres = new Map(S.presence.map((a) => [a.name, a]));
   for (const a of p.agents) {
     const card = memberCards.get(a.name);
     const st = pres.get(a.name) || { status: 'offline' };
-    const state = sceneState(st);
-    const key = `${state}|${a.type}|${Math.min(st.pending || 0, 10)}`;
+    const state = liveState(st);
     const el = card.el;
-    el.className = `member st-${state}`;
-    if (card.sceneKey !== key) {
-      card.sceneKey = key;
-      el.querySelector('.stage-scene').innerHTML = sceneSVG(a.type, state, st);
-    }
-    const cap = el.querySelector('.stage-caption');
-    cap.textContent = cap.title = sceneCaption(state, st);
+    el.className = `member st-${state}${st.ended || st.lostAt ? ' st-gone' : ''}${el.classList.contains('big') ? ' big' : ''}`;
+    const cap = el.querySelector('.live-cap');
+    cap.textContent = cap.title = liveCaption(state, st);
     el.querySelector('.status-dot').className = `status-dot ${st.online ? st.status : 'offline'}`;
     el.querySelector('.member-name').innerHTML = `@${esc(a.name)} <span class="tag ${a.type}">${a.type === 'codex' ? 'Codex' : 'Claude'}</span>${
       st.mode ? `<span class="mode-tag">${MODE_TEXT[st.mode] || st.mode}</span>` : ''
@@ -502,6 +588,7 @@ function renderMembers() {
       ${(st.status === 'working' || st.status === 'quota') && st.mode === 'connector' ? `<button class="btn xs danger-text" data-act="cancel" data-name="${esc(a.name)}" title="${st.status === 'quota' ? '清空等额度恢复的排队任务' : '中止当前任务'}">${st.status === 'quota' ? '清空排队' : '中止'}</button>` : ''}
       ${st.mode === 'connector' && st.listening ? `<button class="btn xs" data-act="reset" data-name="${esc(a.name)}" title="清空该 agent 的 CLI 会话上下文">重置会话</button>` : ''}`;
   }
+  updateAges();
 }
 // ---------- 订阅额度 ----------
 function relTime(t) {
@@ -555,7 +642,9 @@ function modelTag(info) {
   return `<span class="model-tag ${info.model ? '' : 'dim'}" title="${esc(tip)}">${esc(name)}${info.effort ? ` · ${esc(info.effort)}` : ''}</span>`;
 }
 function statusText(st) {
-  let t = st.status === 'idle' && st.mode === 'session' ? (st.listening ? '在线 · 等待消息' : '未在监听') : STATUS_TEXT[st.status] || st.status;
+  let t = st.status === 'idle' && st.mode === 'session' ? (st.listening ? '在线 · 等待消息' : '会话开着 · 未在监听') : STATUS_TEXT[st.status] || st.status;
+  if (st.status === 'offline' && st.ended) t = '会话已关闭';
+  else if (st.status === 'offline' && st.lostAt) t = '失去联系';
   if (st.status === 'quota' && st.until) t = `额度用完 · ${untilText(st.until)}`;
   // 会话模式自己发现不了额度用完，用额度接口的结果补一句
   else if (st.usage?.limited && !st.usage.error && Date.now() - st.usage.ts < 30 * 60_000) t += ' · 订阅额度已用完';
@@ -568,8 +657,17 @@ function statusText(st) {
   return t;
 }
 $('#memberList').addEventListener('click', (e) => {
+  const line = e.target.closest('.ln.long');
+  if (line && !getSelection()?.toString()) return void line.classList.toggle('open'); // 展开 / 收起长内容
   const b = e.target.closest('button[data-act]');
   if (!b) return;
+  if (b.dataset.act === 'size') {
+    const card = b.closest('.member');
+    card.classList.toggle('big');
+    const log = card.querySelector('.live-log');
+    log.scrollTop = log.scrollHeight;
+    return;
+  }
   const name = b.dataset.name;
   if (b.dataset.act === 'at') insertMention(name);
   if (b.dataset.act === 'connect') showConnect(name);

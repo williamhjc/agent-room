@@ -9,6 +9,7 @@
 {
   "type": "hello", "kind": "agent", "projectId": "abc123", "agent": "后端", "token": "<agent token>",
   "mode": "listener",      // listener：常驻监听（连接器）| wait：等待下一条 @（room wait）| tool：一次性命令
+                           // | watch：会话模式的后台监视进程（同步执行过程、报告 CLI 进程退出）
   "caps": ["ack"],         // 声明支持接单回执；不声明的旧客户端"发言即视为接单"
   "historyLimit": 100,     // welcome 里带多少条历史（1-500）
   "host": "my-mac"
@@ -17,14 +18,15 @@
 { "type": "hello", "kind": "user", "projectId": "abc123", "token": "<ADMIN_TOKEN>", "name": "老板" }
 ```
 
-同一 agent 可以同时有多个连接：`listener` 和 `wait` 各只保留最新的一个（旧的以 4009 关闭），`tool` 不限。
+同一 agent 可以同时有多个连接：`listener`、`wait`、`watch` 各只保留最新的一个（旧的以 4009 关闭），`tool` 不限。
 
 服务端回复：
 
 ```jsonc
 { "type": "welcome", "kind": "agent", "mode": "listener", "project": {...}, "self": {...},
   "history": [Message...], "pending": ["未接单的消息id"...], "presence": [...] }
-{ "type": "welcome", "kind": "user", "project": {...}, "history": [...], "hasMore": false, "presence": [...] }
+{ "type": "welcome", "kind": "user", "project": {...}, "history": [...], "hasMore": false, "presence": [...],
+  "activity": { "<agent名>": [Activity...] } }   // 各 agent 最近的执行过程（服务端内存里每个 agent 保留 300 条）
 ```
 
 ## 客户端 → 服务端
@@ -40,6 +42,9 @@
 | `control` | 用户 | `agent`, `action: cancel\|reset` | 中止 agent 当前任务 / 重置 CLI 会话（只对连接器有效） |
 | `recall` | 两者 | `id` | 撤回消息：用户可撤回任何非系统消息，agent 只能撤回自己的。服务端清空内容、取消未接单的派发，广播 `recall` |
 | `info` | agent | `info: { cli, model, effort, source, version }` | 当前模型（`source`：cli 实际运行 / args 启动参数 / config 配置文件 / self 自报 / default）。也可放在 `hello.info` 里 |
+| `activity` | agent | `events: [Activity]`（≤100 条） | 执行过程：连接器从 CLI 输出里取，会话模式由 `watch` 连接从会话记录里取。只推给网页用户，不进聊天记录。`watch` 连接上报时，服务端据此推断会话状态：没在 `room wait` 但有动静 → working；`end` → idle（停在终端） |
+| `session` | agent（watch） | `state: alive|ended`, `reason?`, `cli?`, `pid?` | 会话监视：`ended` 表示会话的 CLI 进程退出，服务端在群里发提醒（`meta.kind = "ack-timeout"`）并把它标为离线 |
+| `bye` | agent | `reason?` | 连接器手动停止前发送，随后断开不算掉线 |
 | `ping` | 两者 | – | 应用层心跳，服务端回 `pong`（`room wait` 每 25 秒一次，70 秒没回就重连） |
 
 ## 服务端 → 客户端
@@ -48,11 +53,26 @@
 |---|---|
 | `message` | 新消息 |
 | `recall` | 消息被撤回：`{ id, message }`（`message.recalled = true`）。连接器收到后从队列移除；正在处理的任务只剩被撤回的消息时停止 |
-| `presence` | （仅用户）各 agent 状态：`online` `listening` `mode`(connector/session) `status` `note` `until`(quota 时) `pending`(待接单数) `usage`(最近一次上报的订阅额度，离线也保留) |
+| `presence` | （仅用户）各 agent 状态：`online` `listening` `watching`(会话监视进程在线) `mode`(connector/session) `status` `note` `until`(quota 时) `pending`(待接单数) `usage`(最近一次上报的订阅额度，离线也保留) `lastOutputAt`(最近一次有执行过程输出) `ended`({at, reason}，会话进程已退出) `lostAt`(连接器 / 会话失去联系的时间) |
+| `activity` | （仅用户）`{ agent, events: [Activity], lastOutputAt }` 新的执行过程 |
 | `project` | 项目配置变化 |
 | `control` | （仅 listener）用户的控制指令 |
 | `sent` / `acked` | 对带 `clientId` 请求的确认 |
 | `error` | 错误；`fatal: true` 时随后断开 |
+
+## Activity（执行过程）
+
+```jsonc
+{ "ts": 1731400000000, "kind": "tool", "text": "运行 npm test" }
+```
+
+`kind`：`think` 思考（`text` 为空表示"思考中"占位）· `say` 写给用户的说明 · `tool` 调用工具 / 运行命令 · `out` 工具输出 · `err` 出错 · `input` 收到的输入 · `sys` 连接器 / 监视进程的提示 · `end` 本轮结束。`text` 最长 2000 字。
+
+## 掉线检测
+
+- `listener` 断开 `LOST_GRACE_MS`（默认 45 秒）还没重连、且断开前没发 `bye`：群里提醒"连接器断开"，`presence.lostAt` 记下时间
+- `watch` 发来 `session` `ended`：立即提醒"会话窗口已关闭"；`watch` 意外断开超过 `LOST_GRACE_MS` 且会话也没在 `room wait`：提醒"会话失去联系"
+- 之后同一 agent 的 `listener` / `wait` / `watch` 重新连上，群里提示"已重新上线"（`meta.kind = "ack-late"`）
 
 ## Message
 

@@ -6,17 +6,19 @@ import os from 'node:os';
 import path from 'node:path';
 import WebSocket from 'ws';
 import { parseMentions } from '../server/store.js';
+import { pidAlive } from '../agent/common.js';
 
 const PORT = 18000 + Math.floor(Math.random() * 1000);
 const BASE = `http://127.0.0.1:${PORT}`;
 const WSURL = `ws://127.0.0.1:${PORT}/ws`;
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-room-test-'));
 const procs = [];
-const childEnv = { ...process.env, HOME: tmp, USERPROFILE: tmp };
+// 测试可能跑在 Claude Code 里：去掉它的环境变量，并关掉会话监视进程（需要时单独打开）
+const childEnv = Object.fromEntries(Object.entries({ ...process.env, HOME: tmp, USERPROFILE: tmp, AGENT_ROOM_NO_WATCH: "1" }).filter(([k]) => !/^(CLAUDE|CODEX)/.test(k)));
 
 function start(args, extraEnv = {}, { capture = false } = {}) {
   const p = spawn(process.execPath, args, {
-    env: { ...childEnv, PORT: String(PORT), DATA_DIR: path.join(tmp, 'data'), ADMIN_TOKEN: 'secret', ACK_CHECK_MS: '300', ...extraEnv },
+    env: { ...childEnv, PORT: String(PORT), DATA_DIR: path.join(tmp, 'data'), ADMIN_TOKEN: 'secret', ACK_CHECK_MS: '300', LOST_GRACE_MS: '1500', ...extraEnv },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   p.out = '';
@@ -45,10 +47,12 @@ async function waitFor(fn, ms = 10000) {
 /** 以网页用户身份连接（带 Origin） */
 async function userClient(projectId, name = '老板', { origin = BASE } = {}) {
   const ws = new WebSocket(WSURL, origin ? { origin } : {});
-  const c = { ws, msgs: [], presence: [], closeCode: null };
+  const c = { ws, msgs: [], presence: [], acts: [], closeCode: null };
   ws.on('message', (raw) => {
     const d = JSON.parse(raw);
     if (d.type === 'message') c.msgs.push(d.message);
+    if (d.type === 'activity') c.acts.push(...d.events.map((e) => ({ ...e, agent: d.agent })));
+    if (d.type === 'welcome') for (const [agent, evs] of Object.entries(d.activity || {})) c.acts.push(...evs.map((e) => ({ ...e, agent })));
     if (d.type === 'presence' || d.type === 'welcome') c.presence = d.presence || d.agents || c.presence;
   });
   ws.on('close', (code) => (c.closeCode = code));
@@ -469,4 +473,111 @@ ${qr}`), 0);
   assert.equal(normBarkUrl('https://api.day.app/abc/这里改成你自己的推送内容'), 'https://api.day.app/abc');
   user.ws.close();
   bark.close();
+});
+
+test('执行过程：连接器把执行过程推到网页；连接器被强制结束后群里提示掉线，重启后提示重新上线并补做', async () => {
+  const { project, tok } = await newProject([{ name: 'Alice', type: 'claude', role: '开发' }]);
+  const user = await userClient(project.id);
+  const argv = ['agent/connector.js', '--server', WSURL, '--project', project.id, '--agent', 'Alice', '--token', tok.Alice, '--workdir', path.join(tmp, 'wd-act'), '--dry-run', '--progress-interval', '0'];
+  let conn = start(argv);
+  await waitFor(() => user.presence.find((a) => a.name === 'Alice' && a.online));
+  user.say('@Alice [模拟耗时:3] 修一下登录页');
+  await waitFor(() => user.acts.find((e) => e.agent === 'Alice' && e.kind === 'input' && e.text.includes('修一下登录页')));
+  assert.ok(user.acts.find((e) => e.agent === 'Alice' && e.kind === 'sys' && /开始处理/.test(e.text)));
+  await waitFor(() => user.presence.find((a) => a.name === 'Alice' && a.status === 'working'));
+
+  // 进程被系统强制结束（内存不足之类，来不及打招呼）
+  conn.kill('SIGKILL');
+  const lost = await waitFor(() => user.msgs.find((m) => m.fromType === 'system' && /@Alice 的连接器断开/.test(m.text)), 8000);
+  assert.match(lost.text, /任务已中断/);
+  await waitFor(() => user.presence.find((a) => a.name === 'Alice' && !a.online && a.lostAt));
+
+  // 后打开的网页也能看到之前的执行过程
+  const user2 = await userClient(project.id, '老板2');
+  await waitFor(() => user2.acts.some((e) => e.agent === 'Alice' && e.text.includes('修一下登录页')));
+
+  // 重启：群里提示重新上线，没做完的任务自动补做
+  conn = start(argv);
+  await waitFor(() => user.msgs.find((m) => m.fromType === 'system' && /@Alice 已重新上线/.test(m.text)), 8000);
+  await waitFor(() => user.msgs.find((m) => m.from === 'Alice' && /修一下登录页/.test(m.text)), 15000);
+  await waitFor(() => user.acts.find((e) => e.agent === 'Alice' && e.kind === 'end'));
+  // 掉线只提示一次
+  assert.equal(user.msgs.filter((m) => m.fromType === 'system' && /连接器断开/.test(m.text)).length, 1);
+  user.ws.close();
+  user2.ws.close();
+});
+
+test('会话模式：room 自动启动后台监视，会话窗口的思考和执行过程实时同步到网页；CLI 进程退出时群里提示', async () => {
+  const { project, tok } = await newProject([{ name: 'Bob', type: 'claude', role: '测试' }]);
+  const user = await userClient(project.id);
+  // 假的 Claude Code 进程和它的会话记录（~/.claude/projects/<目录>/<会话id>.jsonl）
+  const fake = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+  procs.push(fake);
+  const sid = `test-session-${Date.now()}`;
+  const dir = path.join(tmp, '.claude', 'projects', 'C--fake-project');
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, `${sid}.jsonl`);
+  const line = (o) => fs.appendFileSync(file, JSON.stringify({ timestamp: new Date().toISOString(), ...o }) + '\n');
+  line({ type: 'user', message: { role: 'user', content: '开始干活' } });
+  const env = { ...roomEnv(project, 'Bob', tok.Bob), AGENT_ROOM_NO_WATCH: '', CLAUDECODE: '1', CLAUDE_PID: String(fake.pid), CLAUDE_CODE_SESSION_ID: sid };
+  const s = start(['agent/room.js', 'send', '开工了'], env);
+  assert.equal(await exited(s), 0);
+  await waitFor(() => user.presence.find((a) => a.name === 'Bob' && a.watching && a.mode === 'session'), 15000);
+  await waitFor(() => user.acts.find((e) => e.agent === 'Bob' && e.kind === 'input' && e.text === '开始干活'), 8000);
+
+  line({ type: 'assistant', message: { role: 'assistant', stop_reason: 'tool_use', content: [{ type: 'thinking', thinking: '先看看登录页的代码' }] } });
+  line({ type: 'assistant', message: { role: 'assistant', stop_reason: 'tool_use', content: [{ type: 'tool_use', name: 'Bash', input: { command: 'npm test' } }] } });
+  line({ type: 'user', message: { role: 'user', content: [{ type: 'tool_result', content: '14 passing', is_error: false }] } });
+  await waitFor(() => user.acts.find((e) => e.agent === 'Bob' && e.kind === 'out' && e.text === '14 passing'));
+  assert.ok(user.acts.find((e) => e.agent === 'Bob' && e.kind === 'think' && e.text === '先看看登录页的代码'));
+  assert.ok(user.acts.find((e) => e.agent === 'Bob' && e.kind === 'tool' && e.text === '运行 npm test'));
+  await waitFor(() => user.presence.find((a) => a.name === 'Bob' && a.status === 'working'));
+
+  // 一轮结束、停在终端等输入：在线，但不算工作中，也没在监听
+  line({ type: 'assistant', message: { role: 'assistant', stop_reason: 'end_turn', content: [{ type: 'text', text: '改好了' }] } });
+  await waitFor(() => user.presence.find((a) => a.name === 'Bob' && a.online && a.status === 'idle' && !a.listening));
+
+  // 再跑一次 room 命令不会重复起监视进程
+  const lock = JSON.parse(fs.readFileSync(path.join(tmp, '.agent-room', 'state', `${project.id}-Bob.watch.json`), 'utf8'));
+  const s2 = start(['agent/room.js', 'send', '再说一句'], env);
+  assert.equal(await exited(s2), 0);
+  await sleep(1500);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(tmp, '.agent-room', 'state', `${project.id}-Bob.watch.json`), 'utf8')).pid, lock.pid);
+
+  // CLI 进程被关掉 / 被系统结束：群里提示，工位显示会话已关闭
+  fake.kill();
+  const msg = await waitFor(() => user.msgs.find((m) => m.fromType === 'system' && /@Bob 的会话窗口已关闭/.test(m.text)), 15000);
+  assert.match(msg.text, /进程（pid \d+）已退出/);
+  const bob = await waitFor(() => user.presence.find((a) => a.name === 'Bob' && !a.online && a.ended));
+  assert.match(bob.ended.reason, /已退出/);
+  await waitFor(() => !pidAlive(lock.pid), 8000); // 监视进程随之退出
+  user.ws.close();
+});
+
+test('执行过程解析：Codex 会话记录 / exec --json', async () => {
+  const { makeCodexActivity } = await import('../agent/common.js');
+  const conv = makeCodexActivity();
+  const evs = [
+    { type: 'event_msg', payload: { type: 'user_message', message: '修 bug' } },
+    { type: 'response_item', payload: { type: 'reasoning', summary: [{ type: 'summary_text', text: '先跑测试' }] } },
+    { type: 'response_item', payload: { type: 'function_call', name: 'shell', arguments: JSON.stringify({ command: ['bash', '-lc', 'npm test'] }) } },
+    { type: 'response_item', payload: { type: 'function_call_output', output: JSON.stringify({ output: '1 failing', metadata: { exit_code: 1 } }) } },
+    { type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: '修好了' }] } },
+    { type: 'event_msg', payload: { type: 'task_complete' } },
+    { type: 'item.started', item: { id: 'i1', type: 'command_execution', command: 'ls' } },
+    { type: 'item.completed', item: { id: 'i1', type: 'command_execution', command: 'ls', exit_code: 0, aggregated_output: 'a.txt' } },
+  ].flatMap(conv);
+  assert.deepEqual(
+    evs.map((e) => [e.kind, e.text]),
+    [
+      ['input', '修 bug'],
+      ['think', '先跑测试'],
+      ['tool', '运行 npm test'],
+      ['err', '退出码 1\n1 failing'],
+      ['say', '修好了'],
+      ['end', '本轮结束'],
+      ['tool', '运行 ls'],
+      ['out', '退出码 0\na.txt'],
+    ]
+  );
 });

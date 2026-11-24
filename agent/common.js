@@ -210,7 +210,11 @@ export function connectAgent(conn, { mode = 'tool', historyLimit = 100, onMessag
         reject(new Error(`连接 ${conn.server} 超时`));
       }
     }, timeoutMs);
-    const send = (d) => ws.readyState === 1 && ws.send(JSON.stringify(d));
+    const send = (d) => {
+      if (ws.readyState !== 1) return false;
+      ws.send(JSON.stringify(d));
+      return true;
+    };
     let seq = 0;
     const request = (d) =>
       new Promise((res, rej) => {
@@ -644,4 +648,377 @@ export function detectModel(cli, { model = '', extra = [] } = {}) {
   const st = readJsonFile(path.join(dir, 'settings.json'));
   if (st?.model) return { model: st.model, effort: st.effortLevel || '', source: 'config' };
   return { model: '', effort: '', source: 'default' };
+}
+
+// ---------- 执行过程（思考 / 说明 / 工具调用 / 输出）：实时显示在网页工位卡片上 ----------
+// 条目格式 { ts, kind, text }，kind：
+//   think 思考（text 为空表示"思考中"，只是占位）  say 写给用户的说明  tool 调用工具 / 运行命令
+//   out 工具输出  err 出错  input 收到的输入  sys 连接器 / 监视进程的提示  end 本轮结束（会话停在终端等输入）
+export const ACTIVITY_KINDS = ['think', 'say', 'tool', 'out', 'err', 'input', 'sys', 'end'];
+export function clip(s, n) {
+  s = String(s ?? '').replace(/\r/g, '').trim();
+  return s.length > n ? s.slice(0, n - 1) + '…' : s;
+}
+const oneLine = (s, n) => clip(String(s ?? '').replace(/\s+/g, ' '), n);
+const tailText = (s, n) => {
+  s = String(s ?? '').replace(/\r/g, '').trim();
+  return s.length > n ? '…' + s.slice(-(n - 1)) : s;
+};
+
+/** 工具调用的一句话描述；detail=true 时命令等写得更完整（执行过程面板用） */
+export function describeTool(name, i = {}, detail = false) {
+  const base = (p) => (p ? path.basename(String(p)) : '');
+  const n = detail ? 300 : 70;
+  i = i || {};
+  switch (name) {
+    case 'Bash':
+    case 'PowerShell':
+      return `运行 ${oneLine(i.command, n)}`;
+    case 'Edit':
+    case 'MultiEdit':
+    case 'Write':
+    case 'NotebookEdit':
+      return `${name === 'Write' ? '写入' : '编辑'} ${detail ? String(i.file_path || i.notebook_path || '') : base(i.file_path || i.notebook_path)}`;
+    case 'Read':
+      return `查看 ${detail ? String(i.file_path || '') : base(i.file_path)}`;
+    case 'Grep':
+    case 'Glob':
+      return `搜索 ${oneLine(i.pattern, detail ? 120 : 40)}${detail && i.path ? `（${i.path}）` : ''}`;
+    case 'WebFetch':
+    case 'WebSearch':
+      return `查资料 ${oneLine(i.query || i.url, detail ? 200 : 50)}`;
+    case 'Task':
+    case 'Agent':
+      return `派子任务 ${oneLine(i.description, detail ? 120 : 40)}`;
+    case 'TodoWrite': {
+      const t = Array.isArray(i.todos) ? i.todos : [];
+      const cur = t.find((x) => x.status === 'in_progress');
+      return `任务清单 ${t.filter((x) => x.status === 'completed').length}/${t.length}${cur ? `，当前：${oneLine(cur.activeForm || cur.content, 80)}` : ''}`;
+    }
+    default:
+      return `调用 ${name}${detail && Object.keys(i).length ? ` ${oneLine(JSON.stringify(i), 160)}` : ''}`;
+  }
+}
+
+const SYS_TEXT_RE = /^<(command-|local-command|system-reminder|task-notification|bash-|user-prompt)/;
+function blocksText(c) {
+  if (typeof c === 'string') return c;
+  if (!Array.isArray(c)) return '';
+  return c
+    .map((x) => (x?.type === 'text' ? x.text : x?.type === 'image' ? '[图片]' : ''))
+    .filter(Boolean)
+    .join('\n');
+}
+
+/**
+ * Claude Code 的一个事件 → 执行过程条目。两种来源格式相同：
+ * claude -p --output-format stream-json 的输出行，和交互会话的记录文件 ~/.claude/projects/<目录>/<会话id>.jsonl 的行
+ */
+export function claudeActivity(ev) {
+  const out = [];
+  if (!ev || typeof ev !== 'object' || ev.isSidechain || ev.isMeta) return out;
+  const ts = Date.parse(ev.timestamp) || undefined;
+  const add = (kind, text) => out.push({ kind, text, ...(ts ? { ts } : {}) });
+  if (ev.type === 'system' && ev.subtype === 'init') add('sys', `CLI 已启动${ev.model ? `（${ev.model}）` : ''}`);
+  else if (ev.type === 'assistant') {
+    const blocks = Array.isArray(ev.message?.content) ? ev.message.content : [];
+    for (const c of blocks) {
+      if (c.type === 'thinking' || c.type === 'redacted_thinking') add('think', c.thinking?.trim() ? clip(c.thinking, 1500) : '');
+      else if (c.type === 'text' && c.text?.trim()) add('say', clip(c.text, 1500));
+      else if (c.type === 'tool_use' || c.type === 'server_tool_use') add('tool', describeTool(c.name, c.input, true));
+    }
+    // 交互会话里一轮结束（不再调用工具）= 停在终端等人输入；没有在 room wait 的话群里 @ 它收不到
+    if (ev.message?.stop_reason === 'end_turn' && blocks.some((c) => c.type === 'text')) add('end', '本轮结束');
+  } else if (ev.type === 'user') {
+    const c = ev.message?.content;
+    if (typeof c === 'string') {
+      if (c.trim() && !SYS_TEXT_RE.test(c.trim())) add('input', clip(c, 600));
+    } else if (Array.isArray(c)) {
+      for (const b of c) {
+        if (b.type === 'tool_result') {
+          const t = blocksText(b.content);
+          add(b.is_error ? 'err' : 'out', clip(t, 600) || (b.is_error ? '出错' : '（无输出）'));
+        } else if (b.type === 'text' && b.text?.trim() && !SYS_TEXT_RE.test(b.text.trim())) add('input', clip(b.text, 600));
+      }
+    }
+  } else if (ev.type === 'result') {
+    if (ev.is_error) add('err', `本轮出错：${oneLine(ev.result || ev.subtype, 300)}`);
+    else add('sys', `本轮完成${ev.duration_ms ? `，用时 ${Math.round(ev.duration_ms / 1000)} 秒` : ''}`);
+  }
+  return out;
+}
+
+function codexCmd(a) {
+  let c = a?.cmd ?? a?.command ?? '';
+  if (Array.isArray(c)) c = c.length >= 3 && /^(ba|z)?sh$|powershell|pwsh|cmd/i.test(path.basename(String(c[0]))) ? c[c.length - 1] : c.join(' ');
+  return String(c);
+}
+function codexOutput(o) {
+  // function_call_output.output 可能是字符串，也可能是 JSON 字符串 {output, metadata:{exit_code}}
+  let text = typeof o === 'string' ? o : (o?.content ?? o?.output ?? '');
+  let code = null;
+  if (typeof text === 'string' && text.startsWith('{')) {
+    try {
+      const j = JSON.parse(text);
+      text = j.output ?? text;
+      code = j.metadata?.exit_code ?? null;
+    } catch {}
+  }
+  if (Array.isArray(text)) text = text.map((x) => x?.text || '').join('\n');
+  text = String(text ?? '');
+  const m = text.match(/^Exit code: (\d+)/m);
+  if (code === null && m) code = +m[1];
+  return { text: text.replace(/^Exit code: \d+\s*(Wall time:[^\n]*\n)?(Output:\n)?/m, ''), code };
+}
+/**
+ * Codex 事件 → 执行过程条目。支持 codex exec --json 的新旧两种输出，以及交互会话记录
+ * ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl（{timestamp, type: response_item|event_msg, payload}）。
+ * 返回带状态的转换函数（同一条命令的开始和结束只显示一次命令）
+ */
+export function makeCodexActivity() {
+  const started = new Set();
+  return (ev) => {
+    const out = [];
+    if (!ev || typeof ev !== 'object') return out;
+    const ts = Date.parse(ev.timestamp) || undefined;
+    const add = (kind, text) => out.push({ kind, text, ...(ts ? { ts } : {}) });
+    const once = (id, kind, text) => {
+      if (id && started.has(id)) return;
+      if (id) started.add(id);
+      add(kind, text);
+    };
+    // codex exec --json（新版）：thread.started / item.started / item.completed / turn.completed ...
+    if (ev.item) {
+      const it = ev.item;
+      const t = it.type || it.item_type;
+      const done = ev.type === 'item.completed';
+      if (t === 'reasoning') {
+        if (done) add('think', clip(it.text || '', 1500));
+      } else if (t === 'agent_message') {
+        if (done && it.text) add('say', clip(it.text, 1500));
+      } else if (t === 'command_execution') {
+        once(it.id, 'tool', `运行 ${oneLine(it.command, 300)}`);
+        if (done) {
+          const body = `${it.exit_code != null ? `退出码 ${it.exit_code}` : ''}${it.aggregated_output ? `\n${tailText(it.aggregated_output, 600)}` : ''}`.trim();
+          add(it.exit_code ? 'err' : 'out', body || '（无输出）');
+        }
+      } else if (t === 'file_change') {
+        if (done) add('tool', `编辑 ${(it.changes || []).map((c) => c.path).slice(0, 5).join('、')}`);
+      } else if (t === 'mcp_tool_call') {
+        once(it.id, 'tool', `调用 ${it.server || ''}.${it.tool || ''}`);
+        if (done && (it.status === 'failed' || it.error)) add('err', oneLine(it.error?.message || it.error || '调用失败', 300));
+      } else if (t === 'web_search') {
+        if (done) add('tool', `搜索 ${oneLine(it.query, 200)}`);
+      } else if (t === 'todo_list') {
+        const items = it.items || [];
+        const cur = items.find((x) => !x.completed);
+        add('tool', `任务清单 ${items.filter((x) => x.completed).length}/${items.length}${cur ? `，当前：${oneLine(cur.text, 80)}` : ''}`);
+      } else if (t === 'error') add('err', oneLine(it.message, 300));
+      return out;
+    }
+    if (ev.type === 'thread.started') add('sys', 'CLI 已启动');
+    else if (ev.type === 'turn.failed') add('err', `本轮出错：${oneLine(ev.error?.message, 300)}`);
+    else if (ev.type === 'error') add('err', oneLine(ev.message, 300));
+    else if (ev.type === 'response_item') {
+      // 会话记录：模型输出 / 工具调用 / 工具输出
+      const p = ev.payload || {};
+      if (p.type === 'message' && p.role === 'assistant') {
+        const t = (p.content || []).map((x) => x.text || '').join('\n');
+        if (t.trim()) add('say', clip(t, 1500));
+      } else if (p.type === 'reasoning') add('think', clip((p.summary || []).map((x) => x.text || '').join('\n'), 1500));
+      else if (p.type === 'function_call') {
+        let a = {};
+        try {
+          a = JSON.parse(p.arguments || '{}');
+        } catch {}
+        const cmd = codexCmd(a);
+        add('tool', cmd ? `运行 ${oneLine(cmd, 300)}` : `调用 ${p.name}${p.arguments ? ` ${oneLine(p.arguments, 160)}` : ''}`);
+      } else if (p.type === 'local_shell_call') add('tool', `运行 ${oneLine(codexCmd(p.action), 300)}`);
+      else if (p.type === 'custom_tool_call') {
+        const files = [...String(p.input || '').matchAll(/^\*\*\* (?:Update|Add|Delete) File: (.+)$/gm)].map((m) => m[1].trim());
+        add('tool', p.name === 'apply_patch' && files.length ? `编辑 ${files.slice(0, 5).join('、')}` : `调用 ${p.name}`);
+      } else if (p.type === 'function_call_output' || p.type === 'custom_tool_call_output') {
+        const o = codexOutput(p.output);
+        add(o.code ? 'err' : 'out', `${o.code != null ? `退出码 ${o.code}\n` : ''}${tailText(o.text, 600)}`.trim() || '（无输出）');
+      } else if (p.type === 'web_search_call') add('tool', `搜索 ${oneLine(p.action?.query, 200)}`);
+    } else {
+      // 会话记录 event_msg / 旧版 exec --json 的 {msg:{type}}
+      const m = ev.type === 'event_msg' ? ev.payload : ev.msg;
+      if (!m) return out;
+      if (m.type === 'user_message') {
+        if (m.message?.trim()) add('input', clip(m.message, 600));
+      } else if (m.type === 'task_complete') add('end', '本轮结束');
+      else if (m.type === 'turn_aborted') add('err', '本轮被中断');
+      else if (m.type === 'error' || m.type === 'stream_error') add('err', oneLine(m.message, 300));
+      else if (ev.msg) {
+        // 旧版 exec --json 才需要（会话记录里 response_item 已经有这些）
+        if (m.type === 'agent_message') add('say', clip(m.message, 1500));
+        else if (m.type === 'agent_reasoning') add('think', clip(m.text, 1500));
+        else if (m.type === 'exec_command_begin') add('tool', `运行 ${oneLine(codexCmd(m), 300)}`);
+        else if (m.type === 'exec_command_end') add(m.exit_code ? 'err' : 'out', `退出码 ${m.exit_code}\n${tailText(m.aggregated_output || m.stdout || '', 600)}`.trim());
+      }
+    }
+    return out;
+  };
+}
+
+/**
+ * 把执行过程条目攒一小会儿再批量发给服务端：{type:'activity', events}
+ * send(data) 返回 false 表示当前没连上，条目留到下次（最多留 200 条）
+ */
+export function activitySender(send, { interval = 800 } = {}) {
+  let buf = [];
+  let timer = null;
+  const flush = () => {
+    clearTimeout(timer);
+    timer = null;
+    if (!buf.length) return;
+    if (send({ type: 'activity', events: buf.slice(-100) }) === false) {
+      buf = buf.slice(-200);
+      return;
+    }
+    buf = [];
+  };
+  return {
+    push(evs) {
+      for (const e of [].concat(evs || [])) {
+        if (!e || !ACTIVITY_KINDS.includes(e.kind)) continue;
+        buf.push({ ts: e.ts || Date.now(), kind: e.kind, text: String(e.text ?? '') });
+      }
+      if (buf.length && !timer) timer = setTimeout(flush, interval);
+    },
+    flush,
+  };
+}
+
+// ---------- 会话模式：找到正在运行的 CLI 进程和它的会话记录 ----------
+/** 进程是否还活着；pid 为空返回 null（不知道） */
+export function pidAlive(pid) {
+  if (!pid) return null;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return e.code === 'EPERM';
+  }
+}
+function listProcesses() {
+  const map = new Map();
+  if (process.platform === 'win32') {
+    const ps = 'Get-CimInstance Win32_Process | ForEach-Object { "$($_.ProcessId)`t$($_.ParentProcessId)`t$($_.Name)`t$($_.CommandLine)" }';
+    const txt = execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps], { encoding: 'utf8', timeout: 20000, windowsHide: true, maxBuffer: 64 << 20 });
+    for (const line of txt.split(/\r?\n/)) {
+      const [pid, ppid, name, ...cmd] = line.split('\t');
+      if (+pid) map.set(+pid, { pid: +pid, ppid: +ppid, name: name || '', cmd: cmd.join('\t') });
+    }
+  } else {
+    const txt = execFileSync('ps', ['-A', '-o', 'pid=,ppid=,args='], { encoding: 'utf8', timeout: 10000, maxBuffer: 64 << 20 });
+    for (const line of txt.split('\n')) {
+      const m = line.trim().match(/^(\d+)\s+(\d+)\s+(.*)$/);
+      if (m) map.set(+m[1], { pid: +m[1], ppid: +m[2], name: path.basename(m[3].split(' ')[0]), cmd: m[3] });
+    }
+  }
+  return map;
+}
+/**
+ * 找到运行当前命令的 Claude Code / Codex 进程：返回 { cli, pid, session } 或 null。
+ * Claude Code 会把 CLAUDE_PID / CLAUDE_CODE_SESSION_ID 放进子进程环境变量；其他情况沿父进程往上找
+ */
+export function findCliProcess() {
+  const env = process.env;
+  if (env.CLAUDECODE && +env.CLAUDE_PID) return { cli: 'claude', pid: +env.CLAUDE_PID, session: env.CLAUDE_CODE_SESSION_ID || '' };
+  let procs;
+  try {
+    procs = listProcesses();
+  } catch {
+    return null;
+  }
+  let pid = process.ppid;
+  for (let i = 0; i < 15 && pid; i++) {
+    const p = procs.get(pid);
+    if (!p) break;
+    const name = p.name.toLowerCase().replace(/\.exe$/, '');
+    const isNode = name === 'node' || name === 'bun';
+    if (name === 'claude' || (isNode && /@anthropic-ai[\\/]claude-code|claude-code[\\/]cli/i.test(p.cmd))) return { cli: 'claude', pid, session: env.CLAUDE_CODE_SESSION_ID || '' };
+    if (name === 'codex' || name.startsWith('codex-') || (isNode && /@openai[\\/]codex/i.test(p.cmd))) {
+      const idVar = Object.keys(env).find((k) => /^CODEX_.*(THREAD|SESSION|CONVERSATION)_ID$/.test(k));
+      return { cli: 'codex', pid, session: idVar ? env[idVar] : '' };
+    }
+    pid = p.ppid;
+  }
+  return null;
+}
+const samePath = (a, b) => {
+  if (!a || !b) return false;
+  const n = (p) => path.resolve(p).replace(/[\\/]+$/, '');
+  return process.platform === 'win32' ? n(a).toLowerCase() === n(b).toLowerCase() : n(a) === n(b);
+};
+function newestFile(files) {
+  let best = null;
+  for (const f of files) {
+    try {
+      const m = fs.statSync(f).mtimeMs;
+      if (!best || m > best.m) best = { f, m };
+    } catch {}
+  }
+  return best;
+}
+const lsFiles = (dir, re) => {
+  try {
+    return fs
+      .readdirSync(dir)
+      .filter((f) => re.test(f))
+      .map((f) => path.join(dir, f));
+  } catch {
+    return [];
+  }
+};
+function firstLineJson(f) {
+  try {
+    const fd = fs.openSync(f, 'r');
+    const buf = Buffer.alloc(32768);
+    const n = fs.readSync(fd, buf, 0, buf.length, 0);
+    fs.closeSync(fd);
+    return JSON.parse(buf.subarray(0, n).toString('utf8').split('\n')[0]);
+  } catch {
+    return null;
+  }
+}
+/**
+ * 找会话记录文件（jsonl），找不到返回 null。
+ * Claude：~/.claude/projects/<目录>/<会话id>.jsonl；没有会话 id 时取当前目录对应的、最近 10 分钟写过的
+ * Codex：~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl，按会话里记录的 cwd 匹配，取最近写入的
+ */
+export function findTranscript(cli, { session = '', cwd = process.cwd() } = {}) {
+  const fresh = (b) => (b && Date.now() - b.m < 10 * 60_000 ? b.f : null);
+  if (cli === 'claude') {
+    const root = path.join(process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude'), 'projects');
+    let dirs = [];
+    try {
+      dirs = fs.readdirSync(root).map((d) => path.join(root, d));
+    } catch {
+      return null;
+    }
+    if (session) {
+      for (const d of dirs) if (fs.existsSync(path.join(d, `${session}.jsonl`))) return path.join(d, `${session}.jsonl`);
+    }
+    const slug = path.join(root, path.resolve(cwd).replace(/[^a-zA-Z0-9]/g, '-'));
+    return fresh(newestFile(lsFiles(slug, /\.jsonl$/))) || fresh(newestFile(dirs.flatMap((d) => lsFiles(d, /\.jsonl$/))));
+  }
+  if (cli === 'codex') {
+    const root = path.join(codexHome(), 'sessions');
+    const files = [];
+    for (let back = 0; back < 2; back++) {
+      const d = new Date(Date.now() - back * 86400_000);
+      const dir = path.join(root, String(d.getFullYear()), String(d.getMonth() + 1).padStart(2, '0'), String(d.getDate()).padStart(2, '0'));
+      files.push(...lsFiles(dir, /^rollout-.*\.jsonl$/));
+    }
+    if (session) {
+      const f = files.find((x) => path.basename(x).includes(session));
+      if (f) return f;
+    }
+    const sameCwd = files.filter((f) => samePath(firstLineJson(f)?.payload?.cwd, cwd));
+    return fresh(newestFile(sameCwd)) || fresh(newestFile(files));
+  }
+  return null;
 }

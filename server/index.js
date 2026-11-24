@@ -22,6 +22,10 @@ const MAX_TEXT = 100_000;
 const MAX_UPLOAD = 20 * 1024 * 1024;
 const SESSION_WORKING_TTL = 3600_000; // 会话模式下"工作中"状态的最长保留时间（每次 room 命令都会续期）
 const WAIT_GRACE_MS = 150_000; // room wait 断开后多久内仍算"在监听"
+// 连接器 / 会话监视进程断开多久还没回来，就在群里说一声"失去联系"（网络抖一下马上重连的不提示）
+const LOST_GRACE_MS = parseInt(process.env.LOST_GRACE_MS || '45000', 10);
+const ACTIVITY_KEEP = 300; // 每个 agent 在内存里保留多少条执行过程
+const ACTIVITY_KINDS = new Set(['think', 'say', 'tool', 'out', 'err', 'input', 'sys', 'end']);
 
 const store = new Store(DATA_DIR);
 
@@ -157,8 +161,10 @@ async function readBody(req) {
  *   agents: Map<name, AgentState>,
  *   pending: Map<name, Map<msgId, {ts, from, text, warned}>>   // 已派发但未确认接单
  * }
- * AgentState = { conns:Set<ws>, status, note, since, host, lastActivity, idleSince, ackCapable }
+ * AgentState = { conns:Set<ws>, status, note, since, host, lastActivity, idleSince, ackCapable,
+ *                activity:[{ts,kind,text}], lastOutputAt, sessionEnded:{at,reason}, lostAt, outage }
  * 连接 mode：listener（connector/桥接，常驻） | wait（room wait，等待消息） | tool（一次性命令）
+ *           | watch（会话模式的后台监视进程：同步会话窗口的执行过程，CLI 进程退出时报告）
  */
 const rooms = new Map();
 function room(id) {
@@ -168,7 +174,7 @@ function room(id) {
 function agentState(projectId, name) {
   const r = room(projectId);
   if (!r.agents.has(name)) {
-    r.agents.set(name, { conns: new Set(), status: 'idle', note: '', since: null, host: '', lastActivity: 0, idleSince: Date.now(), ackCapable: false });
+    r.agents.set(name, { conns: new Set(), status: 'idle', note: '', since: null, host: '', lastActivity: 0, idleSince: Date.now(), ackCapable: false, activity: [], lastOutputAt: 0 });
   }
   return r.agents.get(name);
 }
@@ -181,12 +187,15 @@ function cleanInfo(i) {
 function connsOf(st, ...modes) {
   return [...st.conns].filter((ws) => modes.includes(ws.ctx.mode));
 }
-function setAgentStatus(st, status, note = '', until = null) {
+function setAgentStatus(st, status, note = '', until = null, via = '') {
   status = ['idle', 'working', 'error', 'quota'].includes(status) ? status : 'idle';
   // quota：模型额度用完 / 限流，until 为预计恢复时间（毫秒时间戳）
   st.until = status === 'quota' && Number(until) > 0 ? Number(until) : null;
   if (status !== 'working' && st.status === 'working') st.idleSince = Date.now();
-  if (status === 'working' && st.status !== 'working') st.workingSince = Date.now();
+  if (status === 'working' && st.status !== 'working') {
+    st.workingSince = Date.now();
+    st.workingVia = via; // ack：room wait 接单 / activity：会话窗口里有动静 / cmd：room send 等命令
+  }
   st.status = status;
   st.note = String(note || '').slice(0, 200);
   st.statusAt = Date.now();
@@ -237,18 +246,25 @@ function presence(projectId) {
     const st = r.agents.get(a.name);
     const listeners = st ? connsOf(st, 'listener') : [];
     const waits = st ? connsOf(st, 'wait') : [];
+    const watching = st ? connsOf(st, 'watch').length > 0 : false;
+    // 会话进程已退出 / 监视进程失联：不再按下面两种"余量"算在线
+    const gone = !!st && !watching && !!(st.sessionEnded || st.lostAt);
     // 会话模式 room wait 超时后要由 agent 重新运行，中间有几秒到一两分钟的空档，不算离线
-    const waitGrace = !!st && !listeners.length && st.lastMode === 'wait' && Date.now() - (st.waitGoneAt || 0) < WAIT_GRACE_MS;
+    const waitGrace = !!st && !gone && !listeners.length && st.lastMode === 'wait' && Date.now() - (st.waitGoneAt || 0) < WAIT_GRACE_MS;
     const listening = listeners.length > 0 || waits.length > 0 || waitGrace;
     // 会话模式（room wait）在处理任务时没有常驻连接，但仍算"工作中"
-    const sessionWorking = st && st.status === 'working' && Date.now() - (st.statusAt || 0) < SESSION_WORKING_TTL;
-    const online = listening || !!sessionWorking;
+    const sessionWorking = st && !gone && st.status === 'working' && Date.now() - (st.statusAt || 0) < SESSION_WORKING_TTL;
+    const online = listening || watching || !!sessionWorking;
     return {
       name: a.name,
       type: a.type,
       online,
       listening,
-      mode: listeners.length ? 'connector' : st?.lastMode === 'wait' ? 'session' : '',
+      watching, // 会话模式有后台监视进程：会话窗口还开着，执行过程实时同步
+      ended: !online && st?.sessionEnded ? st.sessionEnded : null, // { at, reason } 会话进程已退出
+      lostAt: !online && st?.lostAt ? st.lostAt : null, // 连接器 / 会话失去联系的时间
+      lastOutputAt: st?.lastOutputAt || null, // 最近一次有执行过程输出
+      mode: listeners.length ? 'connector' : st?.lastMode === 'wait' || watching || st?.sessionEnded ? 'session' : '',
       status: online ? st.status : 'offline',
       note: online ? st.note : '',
       until: online && st.status === 'quota' ? st.until : null,
@@ -280,6 +296,81 @@ function broadcastPresence(projectId) {
       broadcast(projectId, { type: 'presence', agents: presence(projectId) }, { usersOnly: true });
     }, 50)
   );
+}
+
+// ---------- 执行过程 / 掉线检测 ----------
+function cleanActivity(list) {
+  if (!Array.isArray(list)) return [];
+  const now = Date.now();
+  return list
+    .slice(-100)
+    .filter((e) => e && ACTIVITY_KINDS.has(e.kind))
+    .map((e) => ({ ts: Math.min(now, Number(e.ts) > 0 ? Number(e.ts) : now), kind: e.kind, text: String(e.text ?? '').slice(0, 2000) }));
+}
+/** 记下执行过程并实时推给网页（只推给用户，不推给其他 agent，也不写进聊天记录） */
+function pushActivity(projectId, name, events, { output = true } = {}) {
+  if (!events.length) return;
+  const st = agentState(projectId, name);
+  st.activity.push(...events);
+  if (st.activity.length > ACTIVITY_KEEP) st.activity.splice(0, st.activity.length - ACTIVITY_KEEP);
+  if (output) st.lastOutputAt = Math.max(st.lastOutputAt || 0, ...events.map((e) => e.ts));
+  broadcast(projectId, { type: 'activity', agent: name, events, lastOutputAt: st.lastOutputAt || null }, { usersOnly: true });
+}
+const ROOM_WAIT_RE = /\broom(\.js)?["']?\s+wait\b/;
+/** 会话模式：根据会话窗口里的动静推断状态（没在 room wait 时才推断） */
+function inferSessionStatus(projectId, st, events) {
+  if (connsOf(st, 'listener').length || connsOf(st, 'wait').length || st.status === 'quota') return;
+  const recent = events.filter((e) => Date.now() - e.ts < 60_000); // 监视进程刚启动时补发的历史不算
+  if (!recent.length) return;
+  if (recent.at(-1).kind === 'end') {
+    // 一轮结束、停在终端等人输入：群里 @ 它收不到
+    if (st.status === 'working') {
+      setAgentStatus(st, 'idle', '会话停在终端等待输入，没有在 room wait');
+      broadcastPresence(projectId);
+    }
+    return;
+  }
+  // 工具输出、"思考中"占位、room wait 本身不算干活（room wait 超时重来时也会有这些）
+  const busy = recent.some((e) => (e.kind === 'think' && e.text) || e.kind === 'say' || e.kind === 'input' || (e.kind === 'tool' && !ROOM_WAIT_RE.test(e.text)));
+  if (!busy) return;
+  if (st.status === 'working') st.statusAt = Date.now();
+  else {
+    setAgentStatus(st, 'working', '会话处理中', null, 'activity');
+    broadcastPresence(projectId);
+  }
+}
+/** 连接器 / 会话监视进程断开：等一会儿还没回来，就在群里说一声 */
+function scheduleLost(projectId, name, kind, wasWorking) {
+  const st = agentState(projectId, name);
+  const goneAt = Date.now();
+  st.goneAt = goneAt;
+  setTimeout(() => {
+    if (room(projectId).agents.get(name) !== st || st.goneAt !== goneAt || !store.getProject(projectId)) return;
+    if (connsOf(st, kind).length || connsOf(st, 'listener').length) return; // 已经回来了
+    if (kind === 'watch' && (connsOf(st, 'wait').length || st.sessionEnded)) return; // 会话还在 room wait：只是监视进程没了
+    st.lostAt = Date.now();
+    if (st.status === 'working') setAgentStatus(st, 'idle');
+    const secs = Math.round((Date.now() - goneAt) / 1000);
+    const text =
+      kind === 'listener'
+        ? `⚠️ @${name} 的连接器断开 ${secs} 秒还没重连${wasWorking ? '，正在处理的任务已中断' : ''}。可能是连接器进程被关闭（内存不足、电脑重启 / 休眠）或网络断开。重新启动连接器后，没做完的 @ 会自动补做。`
+        : `⚠️ @${name} 的会话失去联系 ${secs} 秒${wasWorking ? '（它当时正在干活）' : ''}：后台监视进程断开了，可能是电脑休眠 / 关机、网络断开或进程被结束。回到它的会话窗口看一下，窗口还在的话让它运行一次 room wait 就能恢复。`;
+    pushActivity(projectId, name, [{ ts: Date.now(), kind: 'err', text: kind === 'listener' ? '连接器失去联系' : '会话失去联系' }], { output: false });
+    if (!st.outage) {
+      st.outage = true;
+      systemMessage(projectId, text, { kind: 'ack-timeout', agent: name });
+    }
+    broadcastPresence(projectId);
+  }, LOST_GRACE_MS).unref?.();
+}
+/** 之前报过掉线 / 会话退出的 agent 重新连上了 */
+function markBack(projectId, name, st) {
+  const wasOut = st.outage;
+  st.sessionEnded = null;
+  st.lostAt = null;
+  st.outage = false;
+  st.goneAt = 0;
+  if (wasOut) systemMessage(projectId, `✅ @${name} 已重新上线。`, { kind: 'ack-late', agent: name });
 }
 
 function systemMessage(projectId, text, meta) {
@@ -429,6 +520,8 @@ function checkAcks() {
       markPendingDirty();
       let reason;
       if (hasListener) reason = '连接器在线但没有开始处理，可能卡住了，可以在成员面板「中止」后重试';
+      else if (st?.sessionEnded && !connsOf(st, 'watch').length) reason = `它的会话已经关闭（${st.sessionEnded.reason}），需要重新打开会话并运行 room wait`;
+      else if (st && connsOf(st, 'watch').length && !working) reason = '它的会话窗口还开着，但停在终端等输入、没有在 room wait，需要回到窗口让它继续 room wait';
       else if (working) reason = '它还在处理之前的任务，且没有在监听新消息（会话模式需在完成后运行 room wait）';
       else if (st && st.lastMode === 'wait') reason = '它的会话没有在监听（完成上一轮后没有再运行 room wait），需要唤醒它';
       else reason = '它当前离线，请启动它的连接器';
@@ -701,7 +794,14 @@ wss.on('connection', (ws, req) => {
     const st = r.agents.get(ctx.agent);
     if (!st) return;
     st.conns.delete(ws);
-    if (ctx.mode === 'listener' && !connsOf(st, 'listener').length && st.status === 'working') setAgentStatus(st, 'idle');
+    if (ctx.mode === 'listener' && !connsOf(st, 'listener').length && !ctx.replaced) {
+      const wasWorking = st.status === 'working';
+      if (wasWorking) setAgentStatus(st, 'idle');
+      // 手动停止（Ctrl+C）的连接器会先说一声，不算掉线
+      if (ctx.bye) pushActivity(ctx.projectId, ctx.agent, [{ ts: Date.now(), kind: 'sys', text: `连接器已停止（${ctx.bye}）` }], { output: false });
+      else scheduleLost(ctx.projectId, ctx.agent, 'listener', wasWorking);
+    }
+    if (ctx.mode === 'watch' && !connsOf(st, 'watch').length && !ctx.replaced && !st.sessionEnded) scheduleLost(ctx.projectId, ctx.agent, 'watch', st.status === 'working');
     if (ctx.mode === 'wait' && !connsOf(st, 'wait').length) {
       st.waitGoneAt = Date.now();
       setTimeout(() => broadcastPresence(ctx.projectId), WAIT_GRACE_MS + 1000).unref?.();
@@ -738,14 +838,15 @@ function onHello(ws, data, send, req) {
       send({ type: 'error', error: 'agent 名称或 token 不正确', fatal: true });
       return ws.close(4003, 'bad agent credentials');
     }
-    const mode = ['listener', 'wait', 'tool'].includes(data.mode) ? data.mode : 'listener';
+    const mode = ['listener', 'wait', 'tool', 'watch'].includes(data.mode) ? data.mode : 'listener';
     const st = agentState(p.id, def.name);
-    // 同名常驻连接只保留一个（避免两个连接器重复干活）；等待连接也只保留最新的
+    // 同名常驻连接只保留一个（避免两个连接器重复干活）；等待连接、监视连接也只保留最新的
     if (mode !== 'tool') {
       for (const old of connsOf(st, mode)) {
         try {
           old.send(JSON.stringify({ type: 'error', error: `同名 agent 的另一个 ${mode} 连接上线，本连接被替换`, fatal: true }));
         } catch {}
+        old.ctx.replaced = true;
         old.close(4009, 'replaced');
         st.conns.delete(old);
       }
@@ -755,21 +856,27 @@ function onHello(ws, data, send, req) {
     if (Array.isArray(data.caps) && data.caps.includes('ack')) st.ackCapable = true;
     else if (mode === 'listener') st.ackCapable = false;
     st.lastActivity = Date.now();
-    if (mode !== 'tool') {
+    if (mode === 'watch') {
+      // 监视进程不改变"连接器 / 会话"模式的判断，只说明会话窗口还开着
+      st.host ||= String(data.host || req.socket.remoteAddress || '').slice(0, 100);
+      markBack(p.id, def.name, st);
+    } else if (mode !== 'tool') {
       st.since = Date.now();
       st.host = String(data.host || req.socket.remoteAddress || '').slice(0, 100);
       st.lastMode = mode;
+      markBack(p.id, def.name, st);
     }
     if (data.info) st.info = cleanInfo(data.info);
     const noListener = !connsOf(st, 'listener').length;
     if (mode === 'wait') {
       // 正在干活的会话可能把 room wait 放到后台跑：开始干活后还没发过言，就继续算"工作中"（最多 30 分钟）
-      const busy = st.status === 'working' && (st.lastPostAt || 0) < (st.workingSince || 0) && Date.now() - (st.workingSince || 0) < 30 * 60_000;
+      // （只看 room wait 接单开始的工作；因为会话窗口有动静而推断的"工作中"，再次 room wait 就说明干完了）
+      const busy = st.status === 'working' && st.workingVia !== 'activity' && (st.lastPostAt || 0) < (st.workingSince || 0) && Date.now() - (st.workingSince || 0) < 30 * 60_000;
       if (!busy && st.status !== 'quota') setAgentStatus(st, 'idle', '等待新消息');
     } else if (mode === 'tool' && noListener && ACTIVE_CMDS.has(data.cmd) && st.status !== 'quota') {
       // 会话模式在两次 room wait 之间用 room send / inbox 等命令，说明它正在干活
       if (st.status === 'working') st.statusAt = Date.now();
-      else setAgentStatus(st, 'working', '会话处理中');
+      else setAgentStatus(st, 'working', '会话处理中', null, 'cmd');
       broadcastPresence(p.id);
     }
     const { token, ...self } = def;
@@ -812,6 +919,7 @@ function onHello(ws, data, send, req) {
     history: all.slice(-200),
     hasMore: all.length > 200,
     presence: presence(p.id),
+    activity: Object.fromEntries([...r.agents].map(([n, st]) => [n, st.activity.slice(-150)])), // 各 agent 最近的执行过程
   });
 }
 
@@ -885,7 +993,7 @@ function onMessage(ws, data, send) {
       if (!st) return;
       const ids = (Array.isArray(data.ids) ? data.ids : [data.id]).filter(Boolean).map(String);
       ackMessages(ctx.projectId, ctx.agent, ids);
-      if (ctx.mode === 'wait' && ids.length) setAgentStatus(st, 'working', data.note || '处理新消息');
+      if (ctx.mode === 'wait' && ids.length) setAgentStatus(st, 'working', data.note || '处理新消息', null, 'ack');
       broadcastPresence(ctx.projectId);
       if (data.clientId) send({ type: 'acked', clientId: data.clientId });
       return;
@@ -894,6 +1002,43 @@ function onMessage(ws, data, send) {
       if (!st) return;
       setAgentStatus(st, data.status, data.note, data.until);
       broadcastPresence(ctx.projectId);
+      if (data.clientId) send({ type: 'acked', clientId: data.clientId });
+      return;
+    }
+    case 'activity': {
+      // 执行过程（思考 / 工具调用 / 输出）：连接器从 CLI 输出里拿，会话模式由监视进程从会话记录里拿
+      if (!st) return;
+      const events = cleanActivity(data.events);
+      pushActivity(ctx.projectId, ctx.agent, events);
+      if (ctx.mode === 'watch') inferSessionStatus(ctx.projectId, st, events);
+      return;
+    }
+    case 'session': {
+      // 会话监视进程：alive 会话窗口开着；ended 会话的 CLI 进程退出了（被关掉 / 内存不足被系统结束）
+      if (!st) return;
+      if (data.state === 'ended' && !st.sessionEnded) {
+        const reason = String(data.reason || '会话进程已退出').slice(0, 200);
+        const wasWorking = st.status === 'working';
+        st.sessionEnded = { at: Date.now(), reason };
+        if (st.status !== 'quota') setAgentStatus(st, 'idle');
+        pushActivity(ctx.projectId, ctx.agent, [{ ts: Date.now(), kind: 'err', text: `会话已结束：${reason}` }], { output: false });
+        if (!st.outage) {
+          st.outage = true;
+          const cliName = (data.cli || st.watch?.cli) === 'codex' ? 'Codex' : 'Claude Code';
+          systemMessage(
+            ctx.projectId,
+            `⚠️ @${ctx.agent} 的会话窗口已关闭：${reason}${wasWorking ? '，正在处理的任务没有完成' : ''}。可能是被手动关掉，或内存不足被系统结束。重新打开 ${cliName} 会话、让它运行 room wait 就会继续接活，派给它的消息会保留。`,
+            { kind: 'ack-timeout', agent: ctx.agent }
+          );
+        }
+        broadcastPresence(ctx.projectId);
+      } else if (data.state === 'alive') st.watch = { cli: String(data.cli || '').slice(0, 10), pid: Number(data.pid) || 0, at: Date.now() };
+      if (data.clientId) send({ type: 'acked', clientId: data.clientId });
+      return;
+    }
+    case 'bye': {
+      // 连接器手动停止前打招呼：断开时不当作掉线
+      ctx.bye = String(data.reason || '手动停止').slice(0, 100);
       if (data.clientId) send({ type: 'acked', clientId: data.clientId });
       return;
     }
